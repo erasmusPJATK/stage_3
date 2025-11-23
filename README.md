@@ -1,7 +1,3 @@
-Here you go — a complete **`README.md`** for Stage 2 in English, ready to drop into the repo root.
-
----
-
 # Big Data — Stage 2
 
 Monorepo with four independent services (SOA) that implement the pipeline **Ingestion → Indexing → Search**, with **Control** orchestrating the flow.
