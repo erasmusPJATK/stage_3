@@ -5,6 +5,7 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.IMap;
 import com.hazelcast.multimap.MultiMap;
 import io.javalin.Javalin;
+import io.javalin.json.JavalinGson;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -46,15 +47,20 @@ public class IndexingServiceApp {
             } catch (Exception ignored) {}
         });
 
-        Javalin app = Javalin.create(c -> c.http.defaultContentType="application/json").start(port);
+        Javalin app = Javalin.create(cfg -> {
+            cfg.http.defaultContentType = "application/json";
+            cfg.jsonMapper(new JavalinGson());
+        }).start(port);
+
         app.get("/status", ctx -> {
-            ctx.json(Map.of(
-                    "service","indexing",
-                    "port",port,
-                    "hzMembers",hzMembers,
-                    "docs", docs.size(),
-                    "terms", inverted.keySet().size()
-            ));
+            Map<String,Object> payload = new LinkedHashMap<>();
+            payload.put("service","indexing");
+            payload.put("port", port);
+            payload.put("mq", broker);
+            payload.put("hzMembers", hzMembers);
+            payload.put("docs", docs.size());
+            payload.put("terms", inverted.keySet().size());
+            ctx.json(payload);
         });
         Runtime.getRuntime().addShutdownHook(new Thread(consumer::close));
     }
