@@ -2,6 +2,7 @@ package org.ulpgc.bd.ingestion;
 
 import com.google.gson.Gson;
 import io.javalin.Javalin;
+import io.javalin.json.JavalinGson;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
@@ -19,7 +20,10 @@ public class IngestionServiceApp {
         String origin = a.get("origin","http://localhost:"+port);
         Files.createDirectories(Paths.get(datalake));
         MqPublisher pub = new MqPublisher(broker,"books.ingested");
-        Javalin app = Javalin.create(c -> c.http.defaultContentType="application/json").start(port);
+        Javalin app = Javalin.create(cfg -> {
+            cfg.http.defaultContentType = "application/json";
+            cfg.jsonMapper(new JavalinGson());
+        }).start(port);
 
         app.post("/ingest/{id}", ctx -> {
             int id = Integer.parseInt(ctx.pathParam("id"));
