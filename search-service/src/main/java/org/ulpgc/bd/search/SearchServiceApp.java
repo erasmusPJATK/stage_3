@@ -7,18 +7,11 @@ import com.hazelcast.multimap.MultiMap;
 import io.javalin.Javalin;
 import io.javalin.json.JavalinGson;
 
+import java.lang.reflect.Method;
 import java.util.*;
 import java.util.stream.Collectors;
 
 public class SearchServiceApp {
-
-    public static class DocMeta {
-        public int bookId;
-        public String title;
-        public String author;
-        public String language;
-        public int year;
-    }
 
     public static void main(String[] args) {
         Args a = new Args(args);
@@ -29,7 +22,7 @@ public class SearchServiceApp {
 
         HazelcastInstance hz = HazelcastBoot.start(cluster, hzMembers, hzPort);
         MultiMap<String, Integer> inverted = hz.getMultiMap("inverted-index");
-        IMap<Integer, DocMeta> docs = hz.getMap("docs");
+        IMap<Integer, Object> docs = hz.getMap("docs");
         IMap<Integer, Map<String, Integer>> docTerms = hz.getMap("doc-terms");
 
         Javalin app = Javalin.create(cfg -> {
@@ -60,7 +53,6 @@ public class SearchServiceApp {
                     .toLowerCase(Locale.ROOT);
             String author = ctx.queryParam("author");
             String language = ctx.queryParam("language");
-            String yearStr = ctx.queryParam("year");
             int k = 10;
             try {
                 k = Integer.parseInt(Optional.ofNullable(ctx.queryParam("k")).orElse("10"));
@@ -71,47 +63,55 @@ public class SearchServiceApp {
                     .collect(Collectors.toList());
 
             Set<Integer> cand = new HashSet<>();
-            for (String t : terms) cand.addAll(inverted.get(t));
+            for (String t : terms) {
+                Collection<Integer> postings = inverted.get(t);
+                if (postings != null) cand.addAll(postings);
+            }
 
             int N = Math.max(docs.size(), 1);
-            Map<Integer, Double> score = new HashMap<>();
+            Map<Integer, Double> scores = new HashMap<>();
+
             for (String t : terms) {
-                int df = Math.max(inverted.get(t).size(), 1);
+                Collection<Integer> postings = inverted.get(t);
+                if (postings == null || postings.isEmpty()) continue;
+                int df = postings.size();
                 double idf = Math.log(1.0 + (double) N / df);
-                for (Integer d : inverted.get(t)) {
-                    Map<String, Integer> tfm = docTerms.get(d);
+                for (Integer docId : postings) {
+                    Map<String, Integer> tfm = docTerms.get(docId);
                     int tf = tfm != null ? tfm.getOrDefault(t, 0) : 0;
+                    if (tf <= 0) continue;
                     double s = tf * idf;
-                    score.merge(d, s, Double::sum);
+                    scores.merge(docId, s, Double::sum);
                 }
             }
 
-            List<Map<String, Object>> res = cand.stream()
+            List<Map<String, Object>> results = cand.stream()
                     .filter(id -> {
-                        DocMeta m = docs.get(id);
-                        if (m == null) return false;
-                        if (author != null && !author.equalsIgnoreCase(m.author)) return false;
-                        if (language != null && !language.equalsIgnoreCase(m.language)) return false;
-                        if (yearStr != null) {
-                            try {
-                                if (Integer.parseInt(yearStr) != m.year) return false;
-                            } catch (Exception ignored) {}
-                        }
+                        Object raw = docs.get(id);
+                        if (raw == null) return false;
+                        String aVal = getField(raw, "author");
+                        String lVal = getField(raw, "language");
+                        if (author != null && !author.equalsIgnoreCase(aVal)) return false;
+                        if (language != null && !language.equalsIgnoreCase(lVal)) return false;
                         return true;
                     })
                     .sorted((a1, a2) -> Double.compare(
-                            score.getOrDefault(a2, 0.0),
-                            score.getOrDefault(a1, 0.0)))
+                            scores.getOrDefault(a2, 0.0),
+                            scores.getOrDefault(a1, 0.0)
+                    ))
                     .limit(k)
                     .map(id -> {
-                        DocMeta m = docs.get(id);
+                        Object raw = docs.get(id);
+                        String title = getField(raw, "title");
+                        String aVal = getField(raw, "author");
+                        String lVal = getField(raw, "language");
+
                         Map<String, Object> row = new LinkedHashMap<>();
                         row.put("book_id", id);
-                        row.put("title", m == null ? "" : m.title);
-                        row.put("author", m == null ? "" : m.author);
-                        row.put("language", m == null ? "" : m.language);
-                        row.put("year", m == null ? 0 : m.year);
-                        row.put("score", score.getOrDefault(id, 0.0));
+                        row.put("title", title);
+                        row.put("author", aVal);
+                        row.put("language", lVal);
+                        row.put("score", scores.getOrDefault(id, 0.0));
                         return row;
                     })
                     .collect(Collectors.toList());
@@ -121,10 +121,9 @@ public class SearchServiceApp {
             Map<String, Object> filters = new LinkedHashMap<>();
             if (author != null) filters.put("author", author);
             if (language != null) filters.put("language", language);
-            if (yearStr != null) filters.put("year", yearStr);
             payload.put("filters", filters);
-            payload.put("count", res.size());
-            payload.put("results", res);
+            payload.put("count", results.size());
+            payload.put("results", results);
 
             ctx.json(payload);
         });
@@ -136,5 +135,20 @@ public class SearchServiceApp {
             payload.put("hzMembers", hzMembers);
             ctx.json(payload);
         });
+    }
+
+    private static String getField(Object raw, String field) {
+        if (raw == null) return "";
+        if (raw instanceof Map<?, ?> map) {
+            Object v = map.get(field);
+            return v != null ? v.toString() : "";
+        }
+        try {
+            Method m = raw.getClass().getMethod("getString", String.class);
+            Object v = m.invoke(raw, field);
+            return v != null ? v.toString() : "";
+        } catch (Exception ignored) {
+        }
+        return "";
     }
 }
