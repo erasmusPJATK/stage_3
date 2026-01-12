@@ -1,11 +1,21 @@
 package org.ulpgc.bd.ingestion;
 
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 public class Args {
-    private final Map<String,String> m = new HashMap<>();
-    public Args(String[] a){ for(String s:a){ if(s.startsWith("--")){ int i=s.indexOf('='); if(i>2){ m.put(s.substring(2,i), s.substring(i+1)); } else { m.put(s.substring(2), "true"); }}}}
-    public String get(String k,String def){ return m.getOrDefault(k,def); }
-    public int getInt(String k,int def){ try{ return Integer.parseInt(m.get(k)); }catch(Exception e){ return def; } }
+    public static Map<String, String> parse(String[] args) {
+        Map<String, String> out = new LinkedHashMap<>();
+        if (args == null) return out;
+        for (String a : args) {
+            if (a == null) continue;
+            String s = a.trim();
+            if (!s.startsWith("--")) continue;
+            s = s.substring(2);
+            int eq = s.indexOf('=');
+            if (eq < 0) out.put(s, "true");
+            else out.put(s.substring(0, eq).trim(), s.substring(eq + 1).trim());
+        }
+        return out;
+    }
 }

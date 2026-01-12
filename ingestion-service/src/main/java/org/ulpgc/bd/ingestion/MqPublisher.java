@@ -1,36 +1,35 @@
 package org.ulpgc.bd.ingestion;
 
-import com.google.gson.Gson;
 import org.apache.activemq.ActiveMQConnectionFactory;
 
-import javax.jms.*;
+import javax.jms.Connection;
+import javax.jms.MessageProducer;
+import javax.jms.Session;
+import javax.jms.TextMessage;
+import javax.jms.Topic;
 
 public class MqPublisher implements AutoCloseable {
     private final Connection connection;
     private final Session session;
-    private final MessageProducer producer;
-    private static final Gson G = new Gson();
 
-    public MqPublisher(String brokerUrl, String queueName) throws JMSException {
+    public MqPublisher(String brokerUrl) throws Exception {
         ActiveMQConnectionFactory f = new ActiveMQConnectionFactory(brokerUrl);
         this.connection = f.createConnection();
-        this.connection.start();
         this.session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
-        Destination dest = session.createQueue(queueName);
-        this.producer = session.createProducer(dest);
-        this.producer.setDeliveryMode(DeliveryMode.PERSISTENT);
+        this.connection.start();
     }
 
-    public void publish(Object obj) throws JMSException {
-        String json = G.toJson(obj);
-        TextMessage msg = session.createTextMessage(json);
-        producer.send(msg);
+    public void publishTopic(String topicName, String json) throws Exception {
+        Topic topic = session.createTopic(topicName);
+        MessageProducer p = session.createProducer(topic);
+        TextMessage msg = session.createTextMessage(json == null ? "" : json);
+        p.send(msg);
+        p.close();
     }
 
     @Override
-    public void close() {
-        try { producer.close(); } catch(Exception ignored){}
-        try { session.close(); } catch(Exception ignored){}
-        try { connection.close(); } catch(Exception ignored){}
+    public void close() throws Exception {
+        try { session.close(); } catch (Exception ignored) {}
+        try { connection.close(); } catch (Exception ignored) {}
     }
 }

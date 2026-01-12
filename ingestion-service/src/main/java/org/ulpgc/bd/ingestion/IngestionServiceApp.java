@@ -1,71 +1,67 @@
 package org.ulpgc.bd.ingestion;
 
-import com.google.gson.Gson;
 import io.javalin.Javalin;
 import io.javalin.json.JavalinGson;
+import org.ulpgc.bd.ingestion.api.IngestionHttpApi;
+import org.ulpgc.bd.ingestion.io.HttpDownloader;
+import org.ulpgc.bd.ingestion.parser.GutenbergMetaExtractor;
+import org.ulpgc.bd.ingestion.parser.GutenbergSplitter;
+import org.ulpgc.bd.ingestion.replication.MqReplicationHub;
+import org.ulpgc.bd.ingestion.service.IngestionService;
 
-import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
-import java.time.LocalDate;
-import java.time.LocalTime;
-import java.time.format.DateTimeFormatter;
+import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Map;
 
 public class IngestionServiceApp {
+
     public static void main(String[] args) throws Exception {
-        Args a = new Args(args);
-        int port = a.getInt("port",7001);
-        String broker = a.get("mq","tcp://localhost:61616");
-        String datalake = a.get("datalake","datalake");
-        String origin = a.get("origin","http://localhost:"+port);
-        Files.createDirectories(Paths.get(datalake));
-        MqPublisher pub = new MqPublisher(broker,"books.ingested");
-        Javalin app = Javalin.create(cfg -> {
-            cfg.http.defaultContentType = "application/json";
-            cfg.jsonMapper(new JavalinGson());
-        }).start(port);
+        Map<String, String> a = Args.parse(args);
 
-        app.post("/ingest/{id}", ctx -> {
-            int id = Integer.parseInt(ctx.pathParam("id"));
-            String date = LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE);
-            String hour = String.format("%02d", LocalTime.now().getHour());
-            Path dir = Paths.get(datalake, date, hour);
-            Files.createDirectories(dir);
-            Path header = dir.resolve(id+"_header.txt");
-            Path body = dir.resolve(id+"_body.txt");
-            String h = "Title: Sample "+id+"\nAuthor: Unknown\nLanguage: English\nYear: 1900";
-            String b = "Document "+id+" sample text for distributed MVP search indexing.";
-            Files.writeString(header,h, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-            Files.writeString(body,b, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-            pub.publish(Map.of("bookId", id, "origin", origin));
-            ctx.json(Map.of("book_id", id, "status", "ingested", "path", dir.toString(), "origin", origin));
-        });
+        int port = Integer.parseInt(a.getOrDefault("port", "7001"));
+        String mq = a.getOrDefault("mq", "tcp://localhost:61616");
+        String origin = a.getOrDefault("origin", "http://localhost:" + port);
 
-        app.get("/ingest/file/{id}/header", ctx -> {
-            int id = Integer.parseInt(ctx.pathParam("id"));
-            Path p = findLatest(datalake, id, "_header.txt");
-            if(p==null){ ctx.status(404).result("not found"); return; }
-            ctx.contentType("text/plain; charset=utf-8").result(Files.readString(p));
-        });
+        Path moduleRoot = detectModuleRoot(IngestionServiceApp.class);
+        Path datalake = moduleRoot.resolve("datalake").toAbsolutePath().normalize();
 
-        app.get("/ingest/file/{id}/body", ctx -> {
-            int id = Integer.parseInt(ctx.pathParam("id"));
-            Path p = findLatest(datalake, id, "_body.txt");
-            if(p==null){ ctx.status(404).result("not found"); return; }
-            ctx.contentType("text/plain; charset=utf-8").result(Files.readString(p));
-        });
+        String parserVersion = a.getOrDefault("parser", "gutenberg-heuristics-8");
 
-        app.get("/status", ctx -> ctx.json(Map.of("service","ingestion","port",port,"mq",broker,"origin",origin)));
-        Runtime.getRuntime().addShutdownHook(new Thread(pub::close));
+        HttpDownloader downloader = new HttpDownloader("IngestionService/3.0", 6000, 10000);
+        GutenbergSplitter splitter = new GutenbergSplitter();
+        GutenbergMetaExtractor extractor = new GutenbergMetaExtractor();
+
+        IngestionService service = new IngestionService(datalake, parserVersion, downloader, splitter, extractor);
+        service.setOrigin(origin);
+
+        MqReplicationHub hub = new MqReplicationHub(mq, origin, service);
+        hub.start();
+        service.setReplicationHub(hub);
+
+        Javalin app = Javalin.create(cfg -> cfg.jsonMapper(new JavalinGson())).start(port);
+        IngestionHttpApi.register(app, service);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try { hub.close(); } catch (Exception ignored) {}
+        }));
+
+        System.out.println("Ingestion listening on :" + port + " datalake=" + datalake + " mq=" + mq + " origin=" + origin);
     }
 
-    private static Path findLatest(String root, int id, String suffix) throws Exception {
-        Path base = Paths.get(root);
-        if(!Files.exists(base)) return null;
-        Path[] best = new Path[1];
-        try(var s = Files.walk(base)){
-            s.filter(p->p.getFileName()!=null && p.getFileName().toString().equals(id+suffix)).forEach(p-> best[0]=p);
+    private static Path detectModuleRoot(Class<?> anchor) {
+        try {
+            URI uri = anchor.getProtectionDomain().getCodeSource().getLocation().toURI();
+            Path p = Paths.get(uri);
+            if (Files.isRegularFile(p)) p = p.getParent();
+            String name = p.getFileName() != null ? p.getFileName().toString() : "";
+            if (name.equals("classes") || name.equals("test-classes")) p = p.getParent();
+            name = p.getFileName() != null ? p.getFileName().toString() : "";
+            if (name.equals("target") || name.equals("build")) p = p.getParent();
+            return p.toAbsolutePath().normalize();
+        } catch (Exception e) {
+            return Paths.get(".").toAbsolutePath().normalize();
         }
-        return best[0];
     }
 }
