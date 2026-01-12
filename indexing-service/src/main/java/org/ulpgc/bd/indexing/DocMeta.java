@@ -1,6 +1,7 @@
-package org.ulpgc.bd.ingestion.model;
+package org.ulpgc.bd.indexing;
 
-public class Meta {
+public class DocMeta {
+    public int bookId;
     public String title;
     public String author;
     public String language;
