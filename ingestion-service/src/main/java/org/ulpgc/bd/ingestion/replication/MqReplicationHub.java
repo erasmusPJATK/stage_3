@@ -2,13 +2,34 @@ package org.ulpgc.bd.ingestion.replication;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
-import com.google.gson.reflect.TypeToken;
 import org.apache.activemq.ActiveMQConnectionFactory;
 
-import javax.jms.*;
-import java.lang.reflect.Type;
+import javax.jms.Connection;
+import javax.jms.DeliveryMode;
+import javax.jms.Destination;
+import javax.jms.JMSException;
+import javax.jms.Message;
+import javax.jms.MessageConsumer;
+import javax.jms.MessageListener;
+import javax.jms.MessageProducer;
+import javax.jms.Session;
+import javax.jms.TextMessage;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
-import java.util.*;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class MqReplicationHub implements AutoCloseable {
 
@@ -16,170 +37,269 @@ public class MqReplicationHub implements AutoCloseable {
         boolean has(String date, String hour, int bookId, String shaHeader, String shaBody, String shaMeta);
         void store(String date, String hour, int bookId, String header, String body, String metaJson,
                    String shaHeader, String shaBody, String shaMeta) throws Exception;
-        List<ManifestEntry> manifest();
     }
 
     private static final Gson G = new GsonBuilder().disableHtmlEscaping().create();
-    private static final Type LIST_MANIFEST = new TypeToken<List<ManifestEntry>>() {}.getType();
 
-    private final String brokerUrl;
+    private final String mqUrl;
     private final String origin;
     private final LocalFiles local;
-    private final FileDatalakeReplica replica;
+    private final HttpClient http;
 
     private Connection connection;
     private Session session;
-    private MessageProducer eventsProducer;
-    private MessageProducer genericProducer;
-    private MessageConsumer eventsConsumer;
-    private MessageConsumer syncConsumer;
 
-    private Topic eventsTopic;
-    private Topic syncTopic;
+    private Destination replTopic;
+    private Destination peersTopic;
 
-    public MqReplicationHub(String brokerUrl, String origin, LocalFiles local) {
-        this.brokerUrl = brokerUrl;
-        this.origin = origin == null ? "" : origin;
+    private MessageProducer replProducer;
+    private MessageProducer peersProducer;
+
+    private MessageConsumer replConsumer;
+    private MessageConsumer peersConsumer;
+
+    private final Set<String> peers = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+
+    public MqReplicationHub(String mqUrl, String origin, LocalFiles local) {
+        this.mqUrl = mqUrl;
+        this.origin = origin;
         this.local = local;
-        this.replica = new FileDatalakeReplica();
+        this.http = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(4))
+                .version(HttpClient.Version.HTTP_1_1)
+                .followRedirects(HttpClient.Redirect.NORMAL)
+                .build();
     }
 
     public void start() throws Exception {
-        ActiveMQConnectionFactory f = new ActiveMQConnectionFactory(brokerUrl);
-        this.connection = f.createConnection();
-        this.session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
+        ActiveMQConnectionFactory factory = new ActiveMQConnectionFactory(mqUrl);
+        factory.setConnectResponseTimeout(6000);
 
-        this.eventsTopic = session.createTopic("bd.ingestion.events");
-        this.syncTopic = session.createTopic("bd.ingestion.sync");
+        connection = factory.createConnection();
+        connection.setClientID("ingestion_" + stableId(origin));
+        session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
 
-        this.eventsProducer = session.createProducer(eventsTopic);
-        this.genericProducer = session.createProducer(null);
+        replTopic = session.createTopic("bd.ingestion.replication");
+        peersTopic = session.createTopic("bd.ingestion.peers");
 
-        this.eventsConsumer = session.createConsumer(eventsTopic);
-        this.syncConsumer = session.createConsumer(syncTopic);
+        replProducer = session.createProducer(replTopic);
+        replProducer.setDeliveryMode(DeliveryMode.PERSISTENT);
 
-        this.eventsConsumer.setMessageListener(this::onEventsMessage);
-        this.syncConsumer.setMessageListener(this::onSyncMessage);
+        peersProducer = session.createProducer(peersTopic);
+        peersProducer.setDeliveryMode(DeliveryMode.NON_PERSISTENT);
 
-        this.connection.start();
+        replConsumer = session.createConsumer(replTopic);
+        replConsumer.setMessageListener(new ReplicationListener());
 
-        requestSyncOnce();
+        peersConsumer = session.createConsumer(peersTopic);
+        peersConsumer.setMessageListener(new PeersListener());
+
+        connection.start();
+
+        announceHello();
+
+        scheduler.schedule(this::syncFromPeersSafe, 2, TimeUnit.SECONDS);
+        scheduler.scheduleAtFixedRate(this::syncFromPeersSafe, 15, 15, TimeUnit.SECONDS);
     }
 
     public void publishIngested(ReplicationEvent ev) throws Exception {
         if (ev == null) return;
-        ev.type = "INGESTED";
-        ev.origin = this.origin;
+        ev.origin = origin;
+        if (ev.ts == null || ev.ts.isBlank()) ev.ts = Instant.now().toString();
+        String json = G.toJson(ev);
 
-        TextMessage msg = session.createTextMessage(G.toJson(ev));
+        TextMessage msg = session.createTextMessage(json);
+        msg.setStringProperty("origin", origin);
         msg.setStringProperty("type", "INGESTED");
-        eventsProducer.send(msg);
+        replProducer.send(msg);
     }
 
-    private void onEventsMessage(Message m) {
+    private void announceHello() {
         try {
-            if (!(m instanceof TextMessage tm)) return;
-            String json = tm.getText();
-            if (json == null || json.isBlank()) return;
-
-            ReplicationEvent ev = G.fromJson(json, ReplicationEvent.class);
-            if (ev == null) return;
-            if (ev.origin != null && ev.origin.equals(this.origin)) return;
-
-            ManifestEntry me = new ManifestEntry();
-            me.bookId = ev.bookId;
-            me.date = ev.date;
-            me.hour = ev.hour;
-            me.sha256Header = ev.sha256Header;
-            me.sha256Body = ev.sha256Body;
-            me.sha256Meta = ev.sha256Meta;
-            me.parserVersion = ev.parserVersion;
-            me.origin = ev.origin;
-
-            replica.replicate(me, local);
+            PeerMessage pm = new PeerMessage();
+            pm.type = "HELLO";
+            pm.origin = origin;
+            pm.ts = Instant.now().toString();
+            TextMessage msg = session.createTextMessage(G.toJson(pm));
+            msg.setStringProperty("origin", origin);
+            msg.setStringProperty("type", pm.type);
+            peersProducer.send(msg);
         } catch (Exception ignored) {}
     }
 
-    private void onSyncMessage(Message m) {
+    private void announceHelloAck() {
         try {
-            if (!(m instanceof TextMessage tm)) return;
-            String json = tm.getText();
-            if (json == null || json.isBlank()) return;
-
-            Map<?, ?> payload = G.fromJson(json, Map.class);
-            Object t = payload.get("type");
-            if (t == null) return;
-
-            String type = String.valueOf(t);
-            if (!"SYNC_REQUEST".equals(type)) return;
-
-            Destination replyTo = m.getJMSReplyTo();
-            if (replyTo == null) return;
-
-            List<ManifestEntry> entries = local.manifest();
-            Map<String, Object> resp = new LinkedHashMap<>();
-            resp.put("type", "MANIFEST");
-            resp.put("origin", origin);
-            resp.put("ts", Instant.now().toString());
-            resp.put("entries", entries);
-
-            TextMessage out = session.createTextMessage(G.toJson(resp));
-            out.setStringProperty("type", "MANIFEST");
-            genericProducer.send(replyTo, out);
+            PeerMessage pm = new PeerMessage();
+            pm.type = "HELLO_ACK";
+            pm.origin = origin;
+            pm.ts = Instant.now().toString();
+            TextMessage msg = session.createTextMessage(G.toJson(pm));
+            msg.setStringProperty("origin", origin);
+            msg.setStringProperty("type", pm.type);
+            peersProducer.send(msg);
         } catch (Exception ignored) {}
     }
 
-    private void requestSyncOnce() {
+    private void syncFromPeersSafe() {
         try {
-            TemporaryQueue reply = session.createTemporaryQueue();
-            MessageConsumer replyConsumer = session.createConsumer(reply);
+            syncFromPeers();
+        } catch (Exception ignored) {}
+    }
 
-            Map<String, Object> req = new LinkedHashMap<>();
-            req.put("type", "SYNC_REQUEST");
-            req.put("origin", origin);
-            req.put("ts", Instant.now().toString());
+    private void syncFromPeers() throws Exception {
+        Set<String> snapshot = new HashSet<>(peers);
+        snapshot.remove(origin);
+        if (snapshot.isEmpty()) return;
 
-            TextMessage msg = session.createTextMessage(G.toJson(req));
-            msg.setJMSReplyTo(reply);
-            msg.setStringProperty("type", "SYNC_REQUEST");
-            genericProducer.send(syncTopic, msg);
+        for (String peer : snapshot) {
+            ManifestEntry[] manifest = fetchManifest(peer);
+            if (manifest == null || manifest.length == 0) continue;
 
-            long deadline = System.currentTimeMillis() + 4000;
-            while (System.currentTimeMillis() < deadline) {
-                Message r = replyConsumer.receive(800);
-                if (!(r instanceof TextMessage tm)) continue;
+            for (ManifestEntry me : manifest) {
+                if (me == null) continue;
+                if (me.date == null || me.hour == null) continue;
 
-                Map<?, ?> body = G.fromJson(tm.getText(), Map.class);
-                Object typ = body.get("type");
-                if (typ == null || !"MANIFEST".equals(String.valueOf(typ))) continue;
+                boolean ok = local.has(me.date, me.hour, me.bookId, me.sha256Header, me.sha256Body, me.sha256Meta);
+                if (ok) continue;
 
-                String srcOrigin = body.get("origin") == null ? "" : String.valueOf(body.get("origin"));
-                if (srcOrigin.equals(origin)) continue;
+                String header = fetchFile(peer, me.bookId, "header", me.date, me.hour);
+                String body = fetchFile(peer, me.bookId, "body", me.date, me.hour);
+                String meta = fetchFile(peer, me.bookId, "meta", me.date, me.hour);
 
-                Object entObj = body.get("entries");
-                String entJson = G.toJson(entObj);
-                List<ManifestEntry> entries = G.fromJson(entJson, LIST_MANIFEST);
-                if (entries == null) continue;
+                if (header == null) header = "";
+                if (body == null) body = "";
 
-                for (ManifestEntry e : entries) {
-                    if (e == null) continue;
-                    if (e.origin == null || e.origin.isBlank()) e.origin = srcOrigin;
-                    replica.replicate(e, local);
-                }
+                local.store(me.date, me.hour, me.bookId, header, body, meta,
+                        me.sha256Header, me.sha256Body, me.sha256Meta);
             }
+        }
+    }
 
-            try { replyConsumer.close(); } catch (Exception ignored) {}
-            try { reply.delete(); } catch (Exception ignored) {}
-        } catch (Exception ignored) {}
+    private ManifestEntry[] fetchManifest(String peerOrigin) {
+        try {
+            String url = peerOrigin + "/ingest/manifest";
+            HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(Duration.ofSeconds(6))
+                    .GET()
+                    .build();
+            HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
+            if (res.statusCode() != 200) return null;
+            String body = res.body();
+            if (body == null || body.isBlank()) return null;
+            return G.fromJson(body, ManifestEntry[].class);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String fetchFile(String peerOrigin, int bookId, String kind, String date, String hour) {
+        try {
+            String url = peerOrigin + "/ingest/file/" + bookId + "/" + kind
+                    + "?date=" + enc(date) + "&hour=" + enc(hour);
+            HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(Duration.ofSeconds(10))
+                    .GET()
+                    .build();
+            HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
+            if (res.statusCode() != 200) return null;
+            return res.body();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static String enc(String s) {
+        return URLEncoder.encode(s == null ? "" : s, StandardCharsets.UTF_8);
+    }
+
+    private static String stableId(String origin) {
+        String x = origin == null ? "" : origin.trim().toLowerCase();
+        x = x.replace("http://", "").replace("https://", "");
+        x = x.replaceAll("[^a-z0-9]+", "_");
+        if (x.length() > 60) x = x.substring(0, 60);
+        if (x.isBlank()) x = "node";
+        return x;
+    }
+
+    private class ReplicationListener implements MessageListener {
+        @Override
+        public void onMessage(Message message) {
+            try {
+                if (!(message instanceof TextMessage tm)) return;
+                String json = tm.getText();
+                if (json == null || json.isBlank()) return;
+
+                ReplicationEvent ev = G.fromJson(json, ReplicationEvent.class);
+                if (ev == null) return;
+                if (ev.origin == null || ev.origin.isBlank()) return;
+                if (Objects.equals(ev.origin, origin)) return;
+                if (ev.date == null || ev.hour == null) return;
+
+                peers.add(ev.origin);
+
+                boolean ok = local.has(ev.date, ev.hour, ev.bookId, ev.sha256Header, ev.sha256Body, ev.sha256Meta);
+                if (ok) return;
+
+                String header = fetchFile(ev.origin, ev.bookId, "header", ev.date, ev.hour);
+                String body = fetchFile(ev.origin, ev.bookId, "body", ev.date, ev.hour);
+                String meta = fetchFile(ev.origin, ev.bookId, "meta", ev.date, ev.hour);
+
+                if (header == null) header = "";
+                if (body == null) body = "";
+
+                local.store(ev.date, ev.hour, ev.bookId, header, body, meta,
+                        ev.sha256Header, ev.sha256Body, ev.sha256Meta);
+
+            } catch (Exception ignored) {}
+        }
+    }
+
+    private class PeersListener implements MessageListener {
+        @Override
+        public void onMessage(Message message) {
+            try {
+                if (!(message instanceof TextMessage tm)) return;
+                String json = tm.getText();
+                if (json == null || json.isBlank()) return;
+
+                PeerMessage pm = G.fromJson(json, PeerMessage.class);
+                if (pm == null || pm.origin == null || pm.origin.isBlank()) return;
+                if (Objects.equals(pm.origin, origin)) return;
+
+                peers.add(pm.origin);
+
+                if ("HELLO".equalsIgnoreCase(pm.type)) {
+                    announceHelloAck();
+                }
+            } catch (Exception ignored) {}
+        }
+    }
+
+    private static class PeerMessage {
+        String type;
+        String origin;
+        String ts;
     }
 
     @Override
     public void close() throws Exception {
-        try { if (eventsConsumer != null) eventsConsumer.close(); } catch (Exception ignored) {}
-        try { if (syncConsumer != null) syncConsumer.close(); } catch (Exception ignored) {}
-        try { if (eventsProducer != null) eventsProducer.close(); } catch (Exception ignored) {}
-        try { if (genericProducer != null) genericProducer.close(); } catch (Exception ignored) {}
-        try { if (session != null) session.close(); } catch (Exception ignored) {}
-        try { if (connection != null) connection.close(); } catch (Exception ignored) {}
+        scheduler.shutdownNow();
+        safeClose(peersConsumer);
+        safeClose(replConsumer);
+        safeClose(peersProducer);
+        safeClose(replProducer);
+        safeClose(session);
+        safeClose(connection);
+    }
+
+    private static void safeClose(Object o) {
+        if (o == null) return;
+        try {
+            if (o instanceof MessageConsumer c) c.close();
+            else if (o instanceof MessageProducer p) p.close();
+            else if (o instanceof Session s) s.close();
+            else if (o instanceof Connection c) c.close();
+        } catch (JMSException ignored) {}
     }
 }

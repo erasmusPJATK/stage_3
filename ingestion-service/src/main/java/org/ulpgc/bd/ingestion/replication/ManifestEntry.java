@@ -7,6 +7,6 @@ public class ManifestEntry {
     public String sha256Header;
     public String sha256Body;
     public String sha256Meta;
-    public String parserVersion;
     public String origin;
+    public String parserVersion;
 }
