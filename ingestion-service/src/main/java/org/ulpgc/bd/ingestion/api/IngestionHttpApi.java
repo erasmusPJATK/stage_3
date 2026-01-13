@@ -1,7 +1,10 @@
 package org.ulpgc.bd.ingestion.api;
 
 import io.javalin.Javalin;
+import org.ulpgc.bd.ingestion.replication.ManifestEntry;
 import org.ulpgc.bd.ingestion.service.IngestionService;
+
+import java.util.List;
 
 public class IngestionHttpApi {
 
@@ -21,25 +24,32 @@ public class IngestionHttpApi {
 
         app.get("/ingest/list", ctx -> ctx.json(service.listBooks()));
 
-        // Optional debug:
-        app.get("/ingest/manifest", ctx -> ctx.json(service.manifest()));
+        app.get("/ingest/manifest", ctx -> {
+            List<ManifestEntry> m = service.manifest();
+            ctx.json(m);
+        });
 
-        // Required for replication fetching:
         app.get("/ingest/file/{id}/{kind}", ctx -> {
             int id = Integer.parseInt(ctx.pathParam("id"));
-            String kind = ctx.pathParam("kind"); // header|body|meta
+            String kind = ctx.pathParam("kind");
             String date = ctx.queryParam("date");
             String hour = ctx.queryParam("hour");
 
-            String content = switch (kind) {
-                case "header" -> service.readHeader(id, date, hour);
-                case "body" -> service.readBody(id, date, hour);
-                case "meta" -> service.readMeta(id, date, hour);
-                default -> throw new IllegalArgumentException("Bad kind: " + kind);
-            };
-
-            ctx.contentType("text/plain; charset=utf-8");
-            ctx.result(content);
+            try {
+                String out = switch (kind) {
+                    case "header" -> service.readHeader(id, date, hour);
+                    case "body" -> service.readBody(id, date, hour);
+                    case "meta" -> service.readMeta(id, date, hour);
+                    default -> null;
+                };
+                if (out == null) {
+                    ctx.status(400).result("bad kind");
+                } else {
+                    ctx.result(out);
+                }
+            } catch (Exception e) {
+                ctx.status(404).result("not found");
+            }
         });
     }
 }
