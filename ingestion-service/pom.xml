@@ -72,7 +72,7 @@
                             <shadedClassifierName>all</shadedClassifierName>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                                    <mainClass>org.ulpgc.bd.ingestion.IngestionServiceApp</mainClass>
+                                    <mainClass>es.ulpgc.bd.ingestion.IngestionServiceApp</mainClass>
                                 </transformer>
                             </transformers>
                         </configuration>
