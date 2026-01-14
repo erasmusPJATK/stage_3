@@ -44,10 +44,7 @@ public class MqReplicationHub implements AutoCloseable {
     private MessageConsumer eventsConsumer;
     private MessageConsumer helloConsumer;
 
-    private final HttpClient http = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(5))
-            .build();
-
+    private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
     private final ExecutorService exec = Executors.newFixedThreadPool(4);
 
     public MqReplicationHub(String brokerUrl, String origin, LocalFiles local) {
@@ -55,6 +52,9 @@ public class MqReplicationHub implements AutoCloseable {
         this.origin = origin;
         this.local = local;
         this.nodeId = sanitizeNodeId(origin);
+        if (origin != null && (origin.contains("localhost") || origin.contains("127.0.0.1"))) {
+            System.out.println("REPL WARN origin looks local: " + origin);
+        }
     }
 
     public void start() throws JMSException {
@@ -82,6 +82,7 @@ public class MqReplicationHub implements AutoCloseable {
         this.eventsConsumer.setMessageListener(this::onEventsMessage);
         this.helloConsumer.setMessageListener(this::onHelloMessage);
 
+        System.out.println("REPL START nodeId=" + nodeId + " origin=" + origin + " mq=" + brokerUrl);
         publishHello();
     }
 
@@ -89,6 +90,7 @@ public class MqReplicationHub implements AutoCloseable {
         ev.type = "FILE";
         ev.origin = origin;
         sendJson(eventsProducer, ev);
+        System.out.println("REPL TX FILE bookId=" + ev.bookId + " date=" + ev.date + " hour=" + ev.hour + " origin=" + ev.origin);
     }
 
     public void publishHello() throws JMSException {
@@ -96,6 +98,7 @@ public class MqReplicationHub implements AutoCloseable {
         ev.type = "HELLO";
         ev.origin = origin;
         sendJson(helloProducer, ev);
+        System.out.println("REPL TX HELLO origin=" + ev.origin);
     }
 
     private void onHelloMessage(Message m) {
@@ -104,6 +107,7 @@ public class MqReplicationHub implements AutoCloseable {
         if (!"HELLO".equals(ev.type)) return;
         if (ev.origin == null) return;
         if (Objects.equals(ev.origin, origin)) return;
+        System.out.println("REPL RX HELLO from=" + ev.origin);
         exec.submit(() -> replayTo(ev.origin));
     }
 
@@ -124,7 +128,9 @@ public class MqReplicationHub implements AutoCloseable {
                 ev.parserVersion = me.parserVersion;
                 sendJson(eventsProducer, ev);
             }
-        } catch (Exception ignored) {
+            System.out.println("REPL REPLAY to=" + targetOrigin + " count=" + ms.size());
+        } catch (Exception e) {
+            System.out.println("REPL REPLAY FAIL to=" + targetOrigin + " err=" + e.getMessage());
         }
     }
 
@@ -142,8 +148,13 @@ public class MqReplicationHub implements AutoCloseable {
 
         if (date == null || hour == null || bookId <= 0) return;
 
+        System.out.println("REPL RX FILE from=" + ev.origin + " bookId=" + bookId + " date=" + date + " hour=" + hour + " target=" + ev.target);
+
         boolean ok = local.has(date, hour, bookId, ev.sha256Header, ev.sha256Body, ev.sha256Meta);
-        if (ok) return;
+        if (ok) {
+            System.out.println("REPL SKIP have bookId=" + bookId + " date=" + date + " hour=" + hour);
+            return;
+        }
 
         exec.submit(() -> {
             try {
@@ -151,7 +162,9 @@ public class MqReplicationHub implements AutoCloseable {
                 String body = httpGetFile(ev.origin, bookId, "body", date, hour);
                 String meta = httpGetFile(ev.origin, bookId, "meta", date, hour);
                 local.store(date, hour, bookId, header, body, meta, ev.sha256Header, ev.sha256Body, ev.sha256Meta);
-            } catch (Exception ignored) {
+                System.out.println("REPL STORED from=" + ev.origin + " bookId=" + bookId + " date=" + date + " hour=" + hour);
+            } catch (Exception e) {
+                System.out.println("REPL DL FAIL from=" + ev.origin + " bookId=" + bookId + " err=" + e.getMessage());
             }
         });
     }
@@ -168,7 +181,7 @@ public class MqReplicationHub implements AutoCloseable {
 
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() >= 200 && resp.statusCode() < 300) return resp.body();
-        throw new RuntimeException("HTTP " + resp.statusCode());
+        throw new RuntimeException("HTTP " + resp.statusCode() + " url=" + url);
     }
 
     private void sendJson(MessageProducer p, ReplicationEvent ev) throws JMSException {

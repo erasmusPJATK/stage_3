@@ -1,13 +1,13 @@
 package es.ulpgc.bd.ingestion;
 
+import io.javalin.Javalin;
+import io.javalin.json.JavalinGson;
 import es.ulpgc.bd.ingestion.api.IngestionHttpApi;
 import es.ulpgc.bd.ingestion.io.HttpDownloader;
 import es.ulpgc.bd.ingestion.parser.GutenbergMetaExtractor;
 import es.ulpgc.bd.ingestion.parser.GutenbergSplitter;
-import es.ulpgc.bd.ingestion.service.IngestionService;
-import io.javalin.Javalin;
-import io.javalin.json.JavalinGson;
 import es.ulpgc.bd.ingestion.replication.MqReplicationHub;
+import es.ulpgc.bd.ingestion.service.IngestionService;
 
 import java.net.URI;
 import java.nio.file.Files;
@@ -16,17 +16,17 @@ import java.nio.file.Paths;
 import java.util.Map;
 
 public class IngestionServiceApp {
-
     public static void main(String[] args) throws Exception {
         Map<String, String> a = Args.parse(args);
 
         int port = Integer.parseInt(a.getOrDefault("port", "7001"));
         String mq = a.getOrDefault("mq", "tcp://localhost:61616");
-        String origin = a.getOrDefault("origin", "http://localhost:" + port);
+
+        String origin = a.get("origin");
+        if (origin == null || origin.isBlank()) throw new IllegalArgumentException("missing --origin=http://<ip>:" + port);
 
         Path moduleRoot = detectModuleRoot(IngestionServiceApp.class);
         Path datalake = moduleRoot.resolve("datalake").toAbsolutePath().normalize();
-
         String parserVersion = a.getOrDefault("parser", "gutenberg-heuristics-8");
 
         HttpDownloader downloader = new HttpDownloader("IngestionService/3.0", 6000, 10000);
@@ -34,7 +34,6 @@ public class IngestionServiceApp {
         GutenbergMetaExtractor extractor = new GutenbergMetaExtractor();
 
         IngestionService service = new IngestionService(datalake, parserVersion, downloader, splitter, extractor);
-        service.setOrigin(origin);
 
         MqReplicationHub hub = new MqReplicationHub(mq, origin, service);
         hub.start();
