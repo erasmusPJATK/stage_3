@@ -16,14 +16,13 @@ import java.nio.file.Paths;
 import java.util.Map;
 
 public class IngestionServiceApp {
+
     public static void main(String[] args) throws Exception {
         Map<String, String> a = Args.parse(args);
 
         int port = Integer.parseInt(a.getOrDefault("port", "7001"));
         String mq = a.getOrDefault("mq", "tcp://localhost:61616");
-
-        String origin = a.get("origin");
-        if (origin == null || origin.isBlank()) throw new IllegalArgumentException("missing --origin=http://<ip>:" + port);
+        String origin = a.getOrDefault("origin", "http://localhost:" + port);
 
         Path moduleRoot = detectModuleRoot(IngestionServiceApp.class);
         Path datalake = moduleRoot.resolve("datalake").toAbsolutePath().normalize();
@@ -34,13 +33,15 @@ public class IngestionServiceApp {
         GutenbergMetaExtractor extractor = new GutenbergMetaExtractor();
 
         IngestionService service = new IngestionService(datalake, parserVersion, downloader, splitter, extractor);
+        service.setOrigin(origin);
+        service.setMq(mq);
 
         MqReplicationHub hub = new MqReplicationHub(mq, origin, service);
         hub.start();
         service.setReplicationHub(hub);
 
         Javalin app = Javalin.create(cfg -> cfg.jsonMapper(new JavalinGson())).start(port);
-        IngestionHttpApi.register(app, service);
+        IngestionHttpApi.register(app, service, hub);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try { hub.close(); } catch (Exception ignored) {}

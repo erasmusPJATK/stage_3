@@ -3,9 +3,9 @@ package es.ulpgc.bd.ingestion.service;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import es.ulpgc.bd.ingestion.io.HttpDownloader;
+import es.ulpgc.bd.ingestion.model.Meta;
 import es.ulpgc.bd.ingestion.parser.GutenbergMetaExtractor;
 import es.ulpgc.bd.ingestion.parser.GutenbergSplitter;
-import es.ulpgc.bd.ingestion.model.Meta;
 import es.ulpgc.bd.ingestion.replication.DatalakeScanner;
 import es.ulpgc.bd.ingestion.replication.ManifestEntry;
 import es.ulpgc.bd.ingestion.replication.MqReplicationHub;
@@ -23,6 +23,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 public class IngestionService implements MqReplicationHub.LocalFiles {
 
@@ -36,6 +37,7 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
 
     private volatile MqReplicationHub hub;
     private volatile String origin = "";
+    private volatile String mq = "";
 
     public IngestionService(Path datalake, String parserVersion, HttpDownloader downloader, GutenbergSplitter splitter, GutenbergMetaExtractor extractor) {
         this.datalake = datalake;
@@ -53,13 +55,18 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
         this.origin = origin == null ? "" : origin;
     }
 
+    public void setMq(String mq) {
+        this.mq = mq == null ? "" : mq;
+    }
+
     public Map<String, Object> status() {
-        return Map.of(
-                "service", "ingestion",
-                "origin", origin,
-                "datalake", datalake.toString(),
-                "parser_version", parserVersion
-        );
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("service", "ingestion");
+        m.put("datalake", datalake.toString());
+        m.put("parser_version", parserVersion);
+        m.put("origin", origin);
+        m.put("mq", mq);
+        return m;
     }
 
     public Map<String, Object> ingest(int bookId) {
@@ -103,6 +110,8 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
             long t3 = System.nanoTime();
 
             ReplicationEvent ev = new ReplicationEvent();
+            ev.type = "INGESTED";
+            ev.origin = origin;
             ev.bookId = bookId;
             ev.date = date;
             ev.hour = hour;
@@ -110,11 +119,8 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
             ev.sha256Body = shaBody;
             ev.sha256Meta = shaMeta;
             ev.parserVersion = parserVersion;
-            ev.origin = origin;
 
-            if (hub != null) {
-                try { hub.publishIngested(ev); } catch (Exception ignored) {}
-            }
+            if (hub != null) hub.publishIngested(ev);
 
             long resolveMs = (t1 - t0) / 1_000_000L;
             long downloadMs = (t2 - t1) / 1_000_000L;
@@ -151,13 +157,18 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
             boolean headerFound = false;
             boolean bodyFound = false;
             if (Files.exists(datalake)) {
-                try (var stream = Files.walk(datalake)) {
-                    for (Path p : (Iterable<Path>) stream::iterator) {
+                Stream<Path> stream = Files.walk(datalake);
+                try {
+                    Iterator<Path> it = stream.iterator();
+                    while (it.hasNext()) {
+                        Path p = it.next();
                         String fn = p.getFileName() != null ? p.getFileName().toString() : "";
                         if (fn.equals(bookId + "_header.txt")) headerFound = true;
                         if (fn.equals(bookId + "_body.txt")) bodyFound = true;
                         if (headerFound && bodyFound) break;
                     }
+                } finally {
+                    stream.close();
                 }
             }
             response.put("book_id", bookId);
@@ -176,14 +187,18 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
         Set<Integer> ids = new HashSet<>();
         try {
             if (Files.exists(datalake)) {
-                try (var stream = Files.walk(datalake)) {
-                    for (Path p : (Iterable<Path>) stream::iterator) {
+                Stream<Path> stream = Files.walk(datalake);
+                try {
+                    for (Iterator<Path> it = stream.iterator(); it.hasNext(); ) {
+                        Path p = it.next();
                         String fn = p.getFileName() != null ? p.getFileName().toString() : "";
                         Matcher m1 = Pattern.compile("^(\\d+)_header\\.txt$").matcher(fn);
                         Matcher m2 = Pattern.compile("^(\\d+)_body\\.txt$").matcher(fn);
                         if (m1.matches()) ids.add(Integer.parseInt(m1.group(1)));
                         else if (m2.matches()) ids.add(Integer.parseInt(m2.group(1)));
                     }
+                } finally {
+                    stream.close();
                 }
             }
             List<Integer> out = new ArrayList<>(ids);
@@ -242,27 +257,23 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
     private Path resolveFile(int bookId, String kind, String date, String hour) throws Exception {
         if (date != null && hour != null) {
             Path dir = datalake.resolve(date).resolve(hour);
-            Path p = switch (kind) {
-                case "header" -> dir.resolve(bookId + "_header.txt");
-                case "body" -> dir.resolve(bookId + "_body.txt");
-                case "meta" -> dir.resolve(bookId + "_meta.json");
-                default -> null;
-            };
+            Path p = null;
+            if ("header".equals(kind)) p = dir.resolve(bookId + "_header.txt");
+            else if ("body".equals(kind)) p = dir.resolve(bookId + "_body.txt");
+            else if ("meta".equals(kind)) p = dir.resolve(bookId + "_meta.json");
             if (p != null && Files.exists(p)) return p;
         }
 
         Path[] pair = findLatest(bookId);
         if (pair == null) throw new IOException("book not found");
 
-        return switch (kind) {
-            case "header" -> pair[0];
-            case "body" -> pair[1];
-            case "meta" -> {
-                if (pair[2] == null) throw new IOException("meta not found");
-                yield pair[2];
-            }
-            default -> throw new IOException("bad kind");
-        };
+        if ("header".equals(kind)) return pair[0];
+        if ("body".equals(kind)) return pair[1];
+        if ("meta".equals(kind)) {
+            if (pair[2] != null) return pair[2];
+            throw new IOException("meta not found");
+        }
+        throw new IOException("bad kind");
     }
 
     private Path[] findLatest(int bookId) throws IOException {
@@ -314,16 +325,15 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
             Path m = dir.resolve(bookId + "_meta.json");
             if (!Files.exists(h) || !Files.exists(b)) return false;
 
-            if (shaHeader != null && !shaHeader.isBlank()) {
+            if (shaHeader != null && !shaHeader.trim().isEmpty()) {
                 String sh = sha256Hex(Files.readAllBytes(h));
                 if (!shaHeader.equals(sh)) return false;
             }
-            if (shaBody != null && !shaBody.isBlank()) {
+            if (shaBody != null && !shaBody.trim().isEmpty()) {
                 String sb = sha256Hex(Files.readAllBytes(b));
                 if (!shaBody.equals(sb)) return false;
             }
-            if (shaMeta != null && !shaMeta.isBlank()) {
-                if (!Files.exists(m)) return false;
+            if (shaMeta != null && !shaMeta.trim().isEmpty() && Files.exists(m)) {
                 String sm = sha256Hex(Files.readAllBytes(m));
                 if (!shaMeta.equals(sm)) return false;
             }
@@ -334,8 +344,7 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
     }
 
     @Override
-    public void store(String date, String hour, int bookId, String header, String body, String metaJson,
-                      String shaHeader, String shaBody, String shaMeta) throws Exception {
+    public void store(String date, String hour, int bookId, String header, String body, String metaJson, String shaHeader, String shaBody, String shaMeta) throws Exception {
         Path dir = datalake.resolve(date).resolve(hour);
         Files.createDirectories(dir);
         Path h = dir.resolve(bookId + "_header.txt");
@@ -343,6 +352,6 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
         Path m = dir.resolve(bookId + "_meta.json");
         writeAtomic(h, header == null ? "" : header);
         writeAtomic(b, body == null ? "" : body);
-        if (metaJson != null && !metaJson.isBlank()) writeAtomic(m, metaJson);
+        if (metaJson != null && !metaJson.trim().isEmpty()) writeAtomic(m, metaJson);
     }
 }
