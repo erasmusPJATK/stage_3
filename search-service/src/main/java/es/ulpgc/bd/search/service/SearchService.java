@@ -7,9 +7,11 @@ import java.util.*;
 import java.util.regex.Pattern;
 
 public class SearchService {
+
+    // ✅ MUSI pasować do IndexingService:
     private static final String MAP_DOCS = "docs";
-    private static final String MAP_DOC_TERMS = "doc-terms";
-    private static final String MAP_INVERTED = "inverted-index";
+    private static final String MAP_DOC_TERMS = "docTerms";
+    private static final String MAP_INVERTED = "inverted";
 
     private static final Pattern TOKEN = Pattern.compile("[^\\p{IsAlphabetic}\\p{IsDigit}]+");
 
@@ -19,8 +21,8 @@ public class SearchService {
     private final int port;
 
     private final IMap<Integer, Map<String, Object>> docs;
-    private final IMap<Integer, Map<String, Object>> docTerms;
-    private final IMap<String, Object> inverted;
+    private final IMap<Integer, Map<String, Integer>> docTerms;
+    private final IMap<String, Map<Integer, Integer>> inverted;
 
     public SearchService(HazelcastInstance hz, String hzCluster, String hzContact, int port) {
         this.hz = hz;
@@ -39,8 +41,11 @@ public class SearchService {
         out.put("port", port);
         out.put("hzCluster", hzCluster);
         out.put("hz", hzContact);
+
         out.put("docs", docs.size());
-        out.put("terms", inverted.size());
+        out.put("docTermsDocs", docTerms.size());
+        out.put("terms", inverted.size()); // liczba kluczy-termów
+
         return out;
     }
 
@@ -58,6 +63,14 @@ public class SearchService {
                 MAP_DOC_TERMS, docTerms.size(),
                 MAP_INVERTED, inverted.size()
         ));
+
+        // Bonus debug: jakie obiekty są realnie w klastrze
+        List<String> distributed = hz.getDistributedObjects().stream()
+                .map(o -> o.getServiceName() + " -> " + o.getName())
+                .sorted()
+                .toList();
+        out.put("distributedObjects", distributed);
+
         return out;
     }
 
@@ -65,14 +78,20 @@ public class SearchService {
         List<String> terms = tokenize(q);
         if (terms.isEmpty()) return List.of();
 
+        // ✅ candidates = suma (OR) dokumentów z posting list dla każdego termu
         Set<Integer> candidates = new HashSet<>();
         for (String term : terms) {
-            candidates.addAll(postingToDocIds(inverted.get(term)));
+            Map<Integer, Integer> posting = inverted.get(term);
+            if (posting != null) {
+                candidates.addAll(posting.keySet());
+            }
         }
 
         if (candidates.isEmpty()) return List.of();
 
         int N = Math.max(1, docs.size());
+
+        // trzymamy top-N, najmniejszy score wypada jako pierwszy
         PriorityQueue<Map<String, Object>> pq = new PriorityQueue<>(Comparator.comparingDouble(m -> (double) m.get("score")));
 
         for (Integer docId : candidates) {
@@ -80,15 +99,19 @@ public class SearchService {
             if (meta == null) continue;
             if (!passesFilters(meta, author, language, year)) continue;
 
-            Map<String, Object> tfMap = docTerms.get(docId);
+            Map<String, Integer> tfMap = docTerms.get(docId);
             if (tfMap == null) continue;
 
             double score = 0.0;
+
             for (String term : terms) {
-                int tf = getInt(tfMap.get(term));
+                int tf = tfMap.getOrDefault(term, 0);
                 if (tf <= 0) continue;
 
-                int df = postingDf(inverted.get(term));
+                Map<Integer, Integer> posting = inverted.get(term);
+                int df = (posting == null) ? 0 : posting.size();
+
+                // klasyczny smoothed idf
                 double idf = Math.log((N + 1.0) / (df + 1.0)) + 1.0;
                 score += tf * idf;
             }
@@ -125,7 +148,7 @@ public class SearchService {
         if (year != null) {
             Object y = meta.get("year");
             if (y == null) return false;
-            int yi = getInt(y);
+            int yi = toIntOrZero(y);
             if (yi != year) return false;
         }
         return true;
@@ -141,54 +164,15 @@ public class SearchService {
         return out;
     }
 
-    private Set<Integer> postingToDocIds(Object posting) {
-        if (posting == null) return Set.of();
-
-        Set<Integer> out = new HashSet<>();
-
-        if (posting instanceof Collection<?> c) {
-            for (Object o : c) {
-                Integer id = toIntOrNull(o);
-                if (id != null) out.add(id);
-            }
-            return out;
-        }
-
-        if (posting instanceof Map<?, ?> m) {
-            for (Object k : m.keySet()) {
-                Integer id = toIntOrNull(k);
-                if (id != null) out.add(id);
-            }
-            return out;
-        }
-
-        Integer single = toIntOrNull(posting);
-        if (single != null) out.add(single);
-
-        return out;
-    }
-
-    private int postingDf(Object posting) {
-        if (posting == null) return 0;
-        if (posting instanceof Collection<?> c) return c.size();
-        if (posting instanceof Map<?, ?> m) return m.size();
-        return 1;
-    }
-
-    private Integer toIntOrNull(Object o) {
-        if (o == null) return null;
+    private int toIntOrZero(Object o) {
+        if (o == null) return 0;
         if (o instanceof Integer i) return i;
         if (o instanceof Long l) return (int) l.longValue();
         if (o instanceof Double d) return (int) d.doubleValue();
         if (o instanceof String s) {
             try { return Integer.parseInt(s.trim()); } catch (Exception ignored) {}
         }
-        return null;
-    }
-
-    private int getInt(Object o) {
-        Integer v = toIntOrNull(o);
-        return v == null ? 0 : v;
+        return 0;
     }
 
     private String str(Object o) {
