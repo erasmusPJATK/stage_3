@@ -4,6 +4,7 @@ import io.javalin.Javalin;
 import io.javalin.json.JavalinGson;
 import es.ulpgc.bd.ingestion.api.IngestionHttpApi;
 import es.ulpgc.bd.ingestion.io.HttpDownloader;
+import es.ulpgc.bd.ingestion.mq.MqProducer;
 import es.ulpgc.bd.ingestion.parser.GutenbergMetaExtractor;
 import es.ulpgc.bd.ingestion.parser.GutenbergSplitter;
 import es.ulpgc.bd.ingestion.replication.MqReplicationHub;
@@ -24,6 +25,10 @@ public class IngestionServiceApp {
         String mq = a.getOrDefault("mq", "tcp://localhost:61616");
         String origin = a.getOrDefault("origin", "http://localhost:" + port);
 
+        String indexingQueue = a.getOrDefault("indexingQueue", "ingestion.ingested");
+
+        int replFactor = Integer.parseInt(a.getOrDefault("replFactor", a.getOrDefault("replicationFactor", "2")));
+
         Path moduleRoot = detectModuleRoot(IngestionServiceApp.class);
         Path datalake = moduleRoot.resolve("datalake").toAbsolutePath().normalize();
         String parserVersion = a.getOrDefault("parser", "gutenberg-heuristics-8");
@@ -36,9 +41,11 @@ public class IngestionServiceApp {
         service.setOrigin(origin);
         service.setMq(mq);
 
-        MqReplicationHub hub = new MqReplicationHub(mq, origin, service);
+        MqReplicationHub hub = new MqReplicationHub(mq, origin, service, replFactor);
         hub.start();
         service.setReplicationHub(hub);
+
+        service.setIndexingProducer(new MqProducer(mq, indexingQueue), indexingQueue);
 
         Javalin app = Javalin.create(cfg -> cfg.jsonMapper(new JavalinGson())).start(port);
         IngestionHttpApi.register(app, service, hub);
@@ -47,7 +54,12 @@ public class IngestionServiceApp {
             try { hub.close(); } catch (Exception ignored) {}
         }));
 
-        System.out.println("Ingestion listening on :" + port + " datalake=" + datalake + " mq=" + mq + " origin=" + origin);
+        System.out.println("Ingestion listening on :" + port
+                + " datalake=" + datalake
+                + " mq=" + mq
+                + " origin=" + origin
+                + " indexingQueue=" + indexingQueue
+                + " replFactor=" + replFactor);
     }
 
     private static Path detectModuleRoot(Class<?> anchor) {

@@ -1,45 +1,59 @@
 package es.ulpgc.bd.indexing;
 
-import com.hazelcast.config.Config;
-import com.hazelcast.config.InterfacesConfig;
-import com.hazelcast.config.JoinConfig;
-import com.hazelcast.config.NetworkConfig;
-import com.hazelcast.config.TcpIpConfig;
+import com.hazelcast.config.*;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 
-import java.util.Arrays;
-import java.util.List;
-import java.util.stream.Collectors;
-
 public class HazelcastBoot {
 
-    public static HazelcastInstance startMember(String clusterName, String membersCsv, int port, String hzInterface) {
+    public static HazelcastInstance startMember(String clusterName,
+                                                String membersCsv,
+                                                int hzPort,
+                                                String hzInterface) {
+
         Config cfg = new Config();
         cfg.setClusterName(clusterName);
 
+        // Replication (fault tolerance) for the distributed structures
+        cfg.addMapConfig(new MapConfig("docs").setBackupCount(2));
+        cfg.addMapConfig(new MapConfig("docTerms").setBackupCount(2));
+
+        MultiMapConfig mm = new MultiMapConfig("inverted-index");
+        mm.setBackupCount(2);
+        mm.setValueCollectionType(MultiMapConfig.ValueCollectionType.SET);
+        cfg.addMultiMapConfig(mm);
+
         NetworkConfig net = cfg.getNetworkConfig();
-        net.setPort(port);
+        net.setPort(hzPort);
         net.setPortAutoIncrement(true);
 
         if (hzInterface != null && !hzInterface.isBlank()) {
             InterfacesConfig ifc = net.getInterfaces();
             ifc.setEnabled(true);
-            ifc.addInterface(hzInterface.trim());
+            ifc.addInterface(hzInterface);
+            net.setPublicAddress(hzInterface + ":" + hzPort);
         }
 
         JoinConfig join = net.getJoin();
-        join.getMulticastConfig().setEnabled(false);
 
         TcpIpConfig tcp = join.getTcpIpConfig();
-        tcp.setEnabled(true);
+        MulticastConfig mc = join.getMulticastConfig();
 
-        List<String> members = Arrays.stream(membersCsv.split(","))
-                .map(String::trim)
-                .filter(s -> !s.isBlank())
-                .collect(Collectors.toList());
+        if (membersCsv == null || membersCsv.isBlank() || "auto".equalsIgnoreCase(membersCsv) || "multicast".equalsIgnoreCase(membersCsv)) {
+            // Zero-config clustering (matches Stage 3 PDF)
+            tcp.setEnabled(false);
+            mc.setEnabled(true);
+        } else {
+            mc.setEnabled(false);
+            tcp.setEnabled(true);
 
-        for (String m : members) tcp.addMember(m);
+            for (String m : membersCsv.split(",")) {
+                String mmbr = m.trim();
+                if (mmbr.isEmpty()) continue;
+                if (mmbr.contains(":")) tcp.addMember(mmbr);
+                else tcp.addMember(mmbr + ":" + hzPort);
+            }
+        }
 
         return Hazelcast.newHazelcastInstance(cfg);
     }

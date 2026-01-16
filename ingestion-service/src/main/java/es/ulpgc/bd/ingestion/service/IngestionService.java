@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import es.ulpgc.bd.ingestion.io.HttpDownloader;
 import es.ulpgc.bd.ingestion.model.Meta;
+import es.ulpgc.bd.ingestion.mq.MqProducer;
 import es.ulpgc.bd.ingestion.parser.GutenbergMetaExtractor;
 import es.ulpgc.bd.ingestion.parser.GutenbergSplitter;
 import es.ulpgc.bd.ingestion.replication.DatalakeScanner;
@@ -39,6 +40,9 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
     private volatile String origin = "";
     private volatile String mq = "";
 
+    private volatile MqProducer indexingProducer;
+    private volatile String indexingQueueName = "ingestion.ingested";
+
     public IngestionService(Path datalake, String parserVersion, HttpDownloader downloader, GutenbergSplitter splitter, GutenbergMetaExtractor extractor) {
         this.datalake = datalake;
         this.parserVersion = parserVersion;
@@ -59,6 +63,17 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
         this.mq = mq == null ? "" : mq;
     }
 
+    public String getOrigin() {
+        return origin;
+    }
+
+    public void setIndexingProducer(MqProducer producer, String queueName) {
+        this.indexingProducer = producer;
+        if (queueName != null && !queueName.isBlank()) {
+            this.indexingQueueName = queueName.trim();
+        }
+    }
+
     public Map<String, Object> status() {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("service", "ingestion");
@@ -66,6 +81,8 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
         m.put("parser_version", parserVersion);
         m.put("origin", origin);
         m.put("mq", mq);
+        m.put("indexingQueue", indexingQueueName);
+        m.put("indexingMqEnabled", indexingProducer != null);
         return m;
     }
 
@@ -111,7 +128,7 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
 
             ReplicationEvent ev = new ReplicationEvent();
             ev.type = "INGESTED";
-            ev.origin = origin;
+            ev.origin = normalizeOrigin(origin);
             ev.bookId = bookId;
             ev.date = date;
             ev.hour = hour;
@@ -120,7 +137,44 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
             ev.sha256Meta = shaMeta;
             ev.parserVersion = parserVersion;
 
-            if (hub != null) hub.publishIngested(ev);
+            String replStatus = "skipped";
+            String replMessage = null;
+
+            try {
+                if (hub != null) {
+                    hub.publishIngested(ev);
+                    replStatus = "ok";
+                }
+            } catch (Exception ex) {
+                replStatus = "error";
+                replMessage = ex.getMessage();
+            }
+
+            // ✅ NEW: emit indexing message with candidate sources (origin + replicas)
+            String[] sources = null;
+            try {
+                if (hub != null) {
+                    List<String> set = hub.replicaSetFor(ev.origin, bookId);
+                    sources = set.toArray(new String[0]);
+                }
+            } catch (Exception ignored) {}
+
+            if (sources == null || sources.length == 0) {
+                sources = new String[]{ev.origin};
+            }
+
+            String indexingStatus = "skipped";
+            String indexingMessage = null;
+
+            try {
+                if (indexingProducer != null) {
+                    indexingProducer.publish(bookId, ev.origin, sources);
+                    indexingStatus = "ok";
+                }
+            } catch (Exception ex) {
+                indexingStatus = "error";
+                indexingMessage = ex.getMessage();
+            }
 
             long resolveMs = (t1 - t0) / 1_000_000L;
             long downloadMs = (t2 - t1) / 1_000_000L;
@@ -141,6 +195,14 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
             response.put("checksum_sha256_body", shaBody);
             response.put("parser_version", parserVersion);
             response.put("ingested_at", LocalDateTime.now().toString());
+
+            response.put("replication_publish", replStatus);
+            if (replMessage != null && !replMessage.isBlank()) response.put("replication_message", replMessage);
+
+            response.put("indexing_event_publish", indexingStatus);
+            response.put("indexing_queue", indexingQueueName);
+            response.put("indexing_sources", sources);
+            if (indexingMessage != null && !indexingMessage.isBlank()) response.put("indexing_message", indexingMessage);
 
         } catch (Exception e) {
             response.clear();
@@ -314,6 +376,13 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
         } catch (Exception e) {
             return "";
         }
+    }
+
+    private static String normalizeOrigin(String o) {
+        if (o == null) return "";
+        String x = o.trim();
+        if (x.endsWith("/")) x = x.substring(0, x.length() - 1);
+        return x;
     }
 
     @Override
