@@ -1,6 +1,7 @@
 package es.ulpgc.bd.indexing;
 
 import com.hazelcast.core.HazelcastInstance;
+import es.ulpgc.bd.indexing.mq.MqConsumer;
 import es.ulpgc.bd.indexing.service.IndexingService;
 import io.javalin.Javalin;
 
@@ -27,7 +28,9 @@ public class IndexingServiceApp {
         final String hzInterface = first(a, "hzInterface", "hz.interface");
 
         final String ingestion = first(a, "ingestion", "ingestionBase", "ingestion.baseUrl", "ingestionBaseUrl");
+
         final String ingestQueue = a.getOrDefault("ingestQueue", "ingestion.ingested");
+        final boolean mqEnabled = a.getOrDefault("mqIndexingEnabled", "true").equalsIgnoreCase("true");
 
         final HazelcastInstance hz = HazelcastBoot.startMember(hzCluster, hzMembers, hzPort, hzInterface);
         final IndexingService service = new IndexingService(hz);
@@ -44,6 +47,8 @@ public class IndexingServiceApp {
             s.put("hzPort", hzPort);
             s.put("hzInterface", hzInterface);
             s.put("ingestion", ingestion);
+            s.put("ingestQueue", ingestQueue);
+            s.put("mqEnabled", mqEnabled);
             s.putAll(service.stats());
             ctx.json(s);
         });
@@ -61,28 +66,15 @@ public class IndexingServiceApp {
 
         app.start(port);
 
-        final boolean mqEnabled = a.getOrDefault("mqIndexingEnabled", "true").equalsIgnoreCase("true");
         if (mqEnabled) {
-            try {
-                final MqConsumer c = new MqConsumer(mq, ingestQueue);
-                c.listen(msg -> {
-                    try {
-                        final Object bid = msg.get("book_id");
-                        if (!(bid instanceof Number)) return;
-                        final int bookId = ((Number) bid).intValue();
-
-                        String origin = null;
-                        final Object o = msg.get("origin");
-                        if (o instanceof String) origin = (String) o;
-
-                        final String base = (origin != null && !origin.isBlank()) ? origin : ingestion;
-                        service.update(bookId, base);
-                    } catch (Exception ignored) {
-                    }
-                });
-            } catch (Exception ignored) {
-            }
+            MqConsumer consumer = new MqConsumer(mq, ingestQueue, ingestion, service);
+            consumer.startAsync();
         }
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try { app.stop(); } catch (Exception ignored) {}
+            try { hz.shutdown(); } catch (Exception ignored) {}
+        }));
 
         System.out.println("Indexing listening on :" + port);
     }

@@ -1,0 +1,17 @@
+services:
+  activemq:
+    image: rmohr/activemq:latest
+    container_name: activemq
+    ports:
+      - "61616:61616"
+      - "8161:8161"
+
+  lb:
+    image: nginx:alpine
+    container_name: search-lb
+    ports:
+      - "18080:80"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - activemq

@@ -2,6 +2,7 @@ package es.ulpgc.bd.indexing.service;
 
 import com.google.gson.Gson;
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.cp.lock.FencedLock;
 import com.hazelcast.map.IMap;
 import es.ulpgc.bd.indexing.client.IngestionClient;
 
@@ -12,6 +13,8 @@ import java.util.regex.Pattern;
 public class IndexingService {
 
     private final HazelcastInstance hz;
+    private final FencedLock lock;
+
     private final IngestionClient ingestion = new IngestionClient();
     private final Gson gson = new Gson();
 
@@ -23,44 +26,52 @@ public class IndexingService {
 
     public IndexingService(HazelcastInstance hz) {
         this.hz = hz;
+        this.lock = hz.getCPSubsystem().getLock("inverted-index-lock");
         this.docs = hz.getMap("docs");
         this.docTerms = hz.getMap("docTerms");
         this.inverted = hz.getMap("inverted");
     }
 
-    public synchronized Map<String, Object> update(int bookId, String ingestionBaseUrl) throws Exception {
+    public Map<String, Object> update(int bookId, String ingestionBaseUrl) throws Exception {
         if (ingestionBaseUrl == null || ingestionBaseUrl.isBlank()) {
             return Map.of("book_id", bookId, "status", "error", "message", "missing ingestion base url");
         }
 
-        removeIfExists(bookId);
+        lock.lock();
+        try {
+            removeIfExists(bookId);
 
-        String header = ingestion.fetchHeader(ingestionBaseUrl, bookId);
-        String body = ingestion.fetchBody(ingestionBaseUrl, bookId);
-        String meta = ingestion.fetchMetaOrNull(ingestionBaseUrl, bookId);
+            String header = ingestion.fetchHeader(ingestionBaseUrl, bookId);
+            String body = ingestion.fetchBody(ingestionBaseUrl, bookId);
+            String meta = ingestion.fetchMetaOrNull(ingestionBaseUrl, bookId);
 
-        Map<String, Object> metaObj = parseMeta(meta);
-        Map<String, Object> doc = parseHeader(header, metaObj);
-        Map<String, Integer> tf = termFreq(body);
+            Map<String, Object> metaObj = parseMeta(meta);
+            Map<String, Object> doc = parseHeader(header, metaObj);
+            Map<String, Integer> tf = termFreq(body);
 
-        docs.put(bookId, doc);
-        docTerms.put(bookId, tf);
+            docs.put(bookId, doc);
+            docTerms.put(bookId, tf);
 
-        for (Map.Entry<String, Integer> e : tf.entrySet()) {
-            String term = e.getKey();
-            int f = e.getValue();
-            Map<Integer, Integer> postings = inverted.get(term);
-            if (postings == null) postings = new HashMap<>();
-            postings.put(bookId, f);
-            inverted.put(term, postings);
+            for (Map.Entry<String, Integer> e : tf.entrySet()) {
+                String term = e.getKey();
+                int f = e.getValue();
+
+                Map<Integer, Integer> postings = inverted.get(term);
+                if (postings == null) postings = new HashMap<>();
+
+                postings.put(bookId, f);
+                inverted.put(term, postings);
+            }
+
+            return Map.of(
+                    "book_id", bookId,
+                    "status", "ok",
+                    "ingestion", ingestionBaseUrl,
+                    "terms", tf.size()
+            );
+        } finally {
+            try { lock.unlock(); } catch (Exception ignored) {}
         }
-
-        return Map.of(
-                "book_id", bookId,
-                "status", "ok",
-                "ingestion", ingestionBaseUrl,
-                "terms", tf.size()
-        );
     }
 
     private void removeIfExists(int bookId) {
@@ -88,10 +99,11 @@ public class IndexingService {
         if (header != null) {
             for (String line : header.split("\\R")) {
                 String s = line.trim();
-                if (s.toLowerCase().startsWith("title:")) title = s.substring(6).trim();
-                else if (s.toLowerCase().startsWith("author:")) author = s.substring(7).trim();
-                else if (s.toLowerCase().startsWith("language:")) language = s.substring(9).trim();
-                else if (s.toLowerCase().startsWith("year:")) {
+                String low = s.toLowerCase();
+                if (low.startsWith("title:")) title = s.substring(6).trim();
+                else if (low.startsWith("author:")) author = s.substring(7).trim();
+                else if (low.startsWith("language:")) language = s.substring(9).trim();
+                else if (low.startsWith("year:")) {
                     try { year = Integer.parseInt(s.substring(5).trim()); } catch (Exception ignored) {}
                 }
             }

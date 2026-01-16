@@ -8,7 +8,6 @@ import java.util.regex.Pattern;
 
 public class SearchService {
 
-    // ✅ MUSI pasować do IndexingService:
     private static final String MAP_DOCS = "docs";
     private static final String MAP_DOC_TERMS = "docTerms";
     private static final String MAP_INVERTED = "inverted";
@@ -41,11 +40,9 @@ public class SearchService {
         out.put("port", port);
         out.put("hzCluster", hzCluster);
         out.put("hz", hzContact);
-
         out.put("docs", docs.size());
         out.put("docTermsDocs", docTerms.size());
-        out.put("terms", inverted.size()); // liczba kluczy-termów
-
+        out.put("terms", inverted.size());
         return out;
     }
 
@@ -64,7 +61,6 @@ public class SearchService {
                 MAP_INVERTED, inverted.size()
         ));
 
-        // Bonus debug: jakie obiekty są realnie w klastrze
         List<String> distributed = hz.getDistributedObjects().stream()
                 .map(o -> o.getServiceName() + " -> " + o.getName())
                 .sorted()
@@ -78,21 +74,18 @@ public class SearchService {
         List<String> terms = tokenize(q);
         if (terms.isEmpty()) return List.of();
 
-        // ✅ candidates = suma (OR) dokumentów z posting list dla każdego termu
         Set<Integer> candidates = new HashSet<>();
         for (String term : terms) {
             Map<Integer, Integer> posting = inverted.get(term);
-            if (posting != null) {
-                candidates.addAll(posting.keySet());
-            }
+            if (posting != null) candidates.addAll(posting.keySet());
         }
 
         if (candidates.isEmpty()) return List.of();
 
         int N = Math.max(1, docs.size());
 
-        // trzymamy top-N, najmniejszy score wypada jako pierwszy
-        PriorityQueue<Map<String, Object>> pq = new PriorityQueue<>(Comparator.comparingDouble(m -> (double) m.get("score")));
+        PriorityQueue<Map<String, Object>> pq =
+                new PriorityQueue<>(Comparator.comparingDouble(m -> (double) m.get("score")));
 
         for (Integer docId : candidates) {
             Map<String, Object> meta = docs.get(docId);
@@ -111,7 +104,6 @@ public class SearchService {
                 Map<Integer, Integer> posting = inverted.get(term);
                 int df = (posting == null) ? 0 : posting.size();
 
-                // klasyczny smoothed idf
                 double idf = Math.log((N + 1.0) / (df + 1.0)) + 1.0;
                 score += tf * idf;
             }
@@ -158,9 +150,7 @@ public class SearchService {
         if (q == null) return List.of();
         String[] parts = TOKEN.split(q.toLowerCase().trim());
         List<String> out = new ArrayList<>();
-        for (String p : parts) {
-            if (!p.isBlank()) out.add(p);
-        }
+        for (String p : parts) if (!p.isBlank()) out.add(p);
         return out;
     }
 
