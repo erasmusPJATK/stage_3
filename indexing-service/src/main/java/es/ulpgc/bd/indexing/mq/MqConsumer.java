@@ -4,14 +4,10 @@ import com.google.gson.Gson;
 import es.ulpgc.bd.indexing.service.IndexingService;
 import org.apache.activemq.ActiveMQConnectionFactory;
 
-import javax.jms.Connection;
-import javax.jms.ConnectionFactory;
-import javax.jms.Destination;
-import javax.jms.MapMessage;
-import javax.jms.Message;
-import javax.jms.MessageConsumer;
-import javax.jms.Session;
-import javax.jms.TextMessage;
+import javax.jms.*;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
 
 public class MqConsumer {
 
@@ -91,18 +87,45 @@ public class MqConsumer {
             return;
         }
 
-        String origin = (ev.origin == null || ev.origin.isBlank()) ? null : ev.origin.trim();
-        if (origin == null || origin.isBlank()) origin = defaultOrigin;
+        List<String> sources = buildSources(ev);
 
-        System.out.println("[MQ] document.ingested bookId=" + ev.bookId + " origin=" + origin);
+        System.out.println("[MQ] document.ingested bookId=" + ev.bookId + " sources=" + sources);
 
-        var out = indexing.update(ev.bookId, origin);
+        var out = indexing.update(ev.bookId, sources);
 
         if (out != null && "error".equalsIgnoreCase(String.valueOf(out.get("status")))) {
             throw new RuntimeException("indexing.update returned error: " + out);
         }
 
         System.out.println("[MQ] indexed bookId=" + ev.bookId);
+    }
+
+    private List<String> buildSources(DocumentEvent ev) {
+        LinkedHashSet<String> s = new LinkedHashSet<>();
+
+        if (ev.sources != null) {
+            for (String x : ev.sources) {
+                if (x == null) continue;
+                String t = x.trim();
+                if (t.isEmpty()) continue;
+                if (t.endsWith("/")) t = t.substring(0, t.length() - 1);
+                s.add(t);
+            }
+        }
+
+        if (ev.origin != null && !ev.origin.isBlank()) {
+            String t = ev.origin.trim();
+            if (t.endsWith("/")) t = t.substring(0, t.length() - 1);
+            s.add(t);
+        }
+
+        if (defaultOrigin != null && !defaultOrigin.isBlank()) {
+            String t = defaultOrigin.trim();
+            if (t.endsWith("/")) t = t.substring(0, t.length() - 1);
+            s.add(t);
+        }
+
+        return new ArrayList<>(s);
     }
 
     private DocumentEvent parseEvent(Message msg) throws Exception {

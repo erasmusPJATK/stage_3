@@ -2,6 +2,7 @@ package es.ulpgc.bd.search.service;
 
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.IMap;
+import com.hazelcast.multimap.MultiMap;
 
 import java.util.*;
 import java.util.regex.Pattern;
@@ -10,7 +11,7 @@ public class SearchService {
 
     private static final String MAP_DOCS = "docs";
     private static final String MAP_DOC_TERMS = "docTerms";
-    private static final String MAP_INVERTED = "inverted";
+    private static final String MM_INVERTED = "inverted-index";
 
     private static final Pattern TOKEN = Pattern.compile("[^\\p{IsAlphabetic}\\p{IsDigit}]+");
 
@@ -21,7 +22,7 @@ public class SearchService {
 
     private final IMap<Integer, Map<String, Object>> docs;
     private final IMap<Integer, Map<String, Integer>> docTerms;
-    private final IMap<String, Map<Integer, Integer>> inverted;
+    private final MultiMap<String, Integer> invertedIndex;
 
     public SearchService(HazelcastInstance hz, String hzCluster, String hzContact, int port) {
         this.hz = hz;
@@ -31,7 +32,15 @@ public class SearchService {
 
         this.docs = hz.getMap(MAP_DOCS);
         this.docTerms = hz.getMap(MAP_DOC_TERMS);
-        this.inverted = hz.getMap(MAP_INVERTED);
+        this.invertedIndex = hz.getMultiMap(MM_INVERTED);
+    }
+
+    public boolean isReady() {
+        try {
+            return hz.getLifecycleService().isRunning() && !hz.getCluster().getMembers().isEmpty();
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     public Map<String, Object> status() {
@@ -42,7 +51,7 @@ public class SearchService {
         out.put("hz", hzContact);
         out.put("docs", docs.size());
         out.put("docTermsDocs", docTerms.size());
-        out.put("terms", inverted.size());
+        out.put("terms", invertedIndex.keySet().size());
         return out;
     }
 
@@ -58,14 +67,8 @@ public class SearchService {
         out.put("maps", Map.of(
                 MAP_DOCS, docs.size(),
                 MAP_DOC_TERMS, docTerms.size(),
-                MAP_INVERTED, inverted.size()
+                MM_INVERTED, invertedIndex.keySet().size()
         ));
-
-        List<String> distributed = hz.getDistributedObjects().stream()
-                .map(o -> o.getServiceName() + " -> " + o.getName())
-                .sorted()
-                .toList();
-        out.put("distributedObjects", distributed);
 
         return out;
     }
@@ -76,8 +79,8 @@ public class SearchService {
 
         Set<Integer> candidates = new HashSet<>();
         for (String term : terms) {
-            Map<Integer, Integer> posting = inverted.get(term);
-            if (posting != null) candidates.addAll(posting.keySet());
+            Collection<Integer> docsForTerm = invertedIndex.get(term);
+            if (docsForTerm != null) candidates.addAll(docsForTerm);
         }
 
         if (candidates.isEmpty()) return List.of();
@@ -101,7 +104,7 @@ public class SearchService {
                 int tf = tfMap.getOrDefault(term, 0);
                 if (tf <= 0) continue;
 
-                Map<Integer, Integer> posting = inverted.get(term);
+                Collection<Integer> posting = invertedIndex.get(term);
                 int df = (posting == null) ? 0 : posting.size();
 
                 double idf = Math.log((N + 1.0) / (df + 1.0)) + 1.0;

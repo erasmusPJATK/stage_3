@@ -9,6 +9,8 @@ public class DocumentEvent {
 
     public String origin;
 
+    public String[] sources;
+
     public DocumentEvent() {}
 
     public DocumentEvent(int bookId, String origin) {

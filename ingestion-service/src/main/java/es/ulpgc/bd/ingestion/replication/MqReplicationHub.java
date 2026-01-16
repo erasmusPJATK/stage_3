@@ -2,10 +2,9 @@ package es.ulpgc.bd.ingestion.replication;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
-
-import javax.jms.*;
 import org.apache.activemq.ActiveMQConnectionFactory;
 
+import javax.jms.*;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
@@ -19,7 +18,8 @@ public class MqReplicationHub implements AutoCloseable {
 
     public interface LocalFiles {
         boolean has(String date, String hour, int bookId, String shaHeader, String shaBody, String shaMeta);
-        void store(String date, String hour, int bookId, String header, String body, String metaJson, String shaHeader, String shaBody, String shaMeta) throws Exception;
+        void store(String date, String hour, int bookId, String header, String body, String metaJson,
+                   String shaHeader, String shaBody, String shaMeta) throws Exception;
     }
 
     private static final Gson G = new GsonBuilder().disableHtmlEscaping().create();
@@ -32,6 +32,9 @@ public class MqReplicationHub implements AutoCloseable {
     private final String nodeId;
     private final LocalFiles local;
 
+    // Replication factor R (usually 2 or 3)
+    private final int replFactor;
+
     private volatile Connection connection;
     private volatile Session session;
     private volatile MessageProducer producerHello;
@@ -42,16 +45,19 @@ public class MqReplicationHub implements AutoCloseable {
     private final Map<String, Object> state = new ConcurrentHashMap<>();
     private final Map<String, Long> peers = new ConcurrentHashMap<>();
 
-    public MqReplicationHub(String brokerUrl, String origin, LocalFiles local) {
+    public MqReplicationHub(String brokerUrl, String origin, LocalFiles local, int replFactor) {
         this.brokerUrl = brokerUrl;
-        this.origin = origin;
+        this.origin = normalizeOrigin(origin);
         this.local = local;
-        this.nodeId = originHost(origin) + "_" + originPort(origin);
+        this.replFactor = Math.max(1, replFactor);
+
+        this.nodeId = originHost(this.origin) + "_" + originPort(this.origin);
+
         state.put("nodeId", nodeId);
-        state.put("origin", origin);
+        state.put("origin", this.origin);
         state.put("mq", brokerUrl);
+        state.put("replicationFactor", this.replFactor);
         state.put("connected", false);
-        state.put("peers", new ArrayList<>());
         state.put("lastError", "");
         state.put("lastHelloRx", "");
         state.put("lastEventRx", "");
@@ -83,8 +89,23 @@ public class MqReplicationHub implements AutoCloseable {
 
             state.put("connected", true);
 
-            System.out.println("REPL START nodeId=" + nodeId + " origin=" + origin + " mq=" + brokerUrl);
+            System.out.println("REPL START nodeId=" + nodeId + " origin=" + origin + " mq=" + brokerUrl + " R=" + replFactor);
+
+            // announce self
             publishHello();
+
+            // simple heartbeat so late joiners will still discover existing nodes
+            Thread hb = new Thread(() -> {
+                while (true) {
+                    try {
+                        Thread.sleep(10_000);
+                        publishHello();
+                    } catch (Exception ignored) {}
+                }
+            }, "repl-hello-heartbeat");
+            hb.setDaemon(true);
+            hb.start();
+
         } catch (Exception e) {
             state.put("connected", false);
             state.put("lastError", e.toString());
@@ -104,19 +125,55 @@ public class MqReplicationHub implements AutoCloseable {
         }
     }
 
+    /**
+     * Replica set for a doc: primaryOrigin + (R-1) peers picked deterministically by bookId.
+     * This matches the "replication factor R" requirement from the Stage 3 PDF.
+     */
+    public List<String> replicaSetFor(String primaryOrigin, int bookId) {
+        String primary = normalizeOrigin(primaryOrigin);
+
+        List<String> all = knownOriginsSorted();
+        if (!all.contains(primary)) {
+            all.add(primary);
+            Collections.sort(all);
+        }
+
+        int r = Math.min(replFactor, all.size());
+        if (r <= 1) return List.of(primary);
+
+        // candidates = all origins except primary
+        List<String> candidates = new ArrayList<>(all);
+        candidates.remove(primary);
+
+        int need = Math.min(r - 1, candidates.size());
+        List<String> out = new ArrayList<>();
+        out.add(primary);
+
+        if (need <= 0) return out;
+
+        int start = Math.floorMod(Integer.hashCode(bookId), candidates.size());
+        for (int i = 0; i < need; i++) {
+            out.add(candidates.get((start + i) % candidates.size()));
+        }
+        return out;
+    }
+
     public Map<String, Object> state() {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("nodeId", state.get("nodeId"));
         m.put("origin", state.get("origin"));
         m.put("mq", state.get("mq"));
+        m.put("replicationFactor", state.get("replicationFactor"));
         m.put("connected", state.get("connected"));
         m.put("lastError", state.get("lastError"));
         m.put("lastHelloRx", state.get("lastHelloRx"));
         m.put("lastEventRx", state.get("lastEventRx"));
         m.put("lastSync", state.get("lastSync"));
+
         List<String> ps = new ArrayList<>(peers.keySet());
         Collections.sort(ps);
         m.put("peers", ps);
+
         return m;
     }
 
@@ -127,12 +184,11 @@ public class MqReplicationHub implements AutoCloseable {
             hello.put("origin", origin);
             hello.put("nodeId", nodeId);
             hello.put("ts", Instant.now().toString());
+
             TextMessage m = session.createTextMessage(G.toJson(hello));
             producerHello.send(m);
-            System.out.println("REPL TX HELLO origin=" + origin);
         } catch (Exception e) {
             state.put("lastError", e.toString());
-            throw new RuntimeException("REPL hello failed: " + e.getMessage(), e);
         }
     }
 
@@ -140,23 +196,28 @@ public class MqReplicationHub implements AutoCloseable {
         try {
             if (!(msg instanceof TextMessage)) return;
             String s = ((TextMessage) msg).getText();
+
             @SuppressWarnings("unchecked")
             Map<String, Object> m = G.fromJson(s, Map.class);
-            Object t = m.get("type");
-            if (t == null || !"HELLO".equals(t.toString())) return;
 
-            String peerOrigin = str(m.get("origin"));
+            if (!"HELLO".equals(String.valueOf(m.get("type")))) return;
+
+            String peerOrigin = normalizeOrigin(str(m.get("origin")));
             if (peerOrigin == null || peerOrigin.isBlank()) return;
             if (peerOrigin.equals(origin)) return;
 
+            boolean isNewPeer = (peers.putIfAbsent(peerOrigin, System.currentTimeMillis()) == null);
             peers.put(peerOrigin, System.currentTimeMillis());
+
             state.put("lastHelloRx", Instant.now().toString());
-            System.out.println("REPL RX HELLO from=" + peerOrigin);
 
-            new Thread(() -> {
-                try { syncFromPeer(peerOrigin); } catch (Exception ex) { state.put("lastError", ex.toString()); }
-            }).start();
-
+            // IMPORTANT FIX: handshake, so late joiners discover existing nodes
+            if (isNewPeer) {
+                publishHello();
+                new Thread(() -> {
+                    try { syncFromPeer(peerOrigin); } catch (Exception ex) { state.put("lastError", ex.toString()); }
+                }, "repl-sync-" + peerOrigin).start();
+            }
         } catch (Exception e) {
             state.put("lastError", e.toString());
         }
@@ -166,14 +227,19 @@ public class MqReplicationHub implements AutoCloseable {
         try {
             if (!(msg instanceof TextMessage)) return;
             String s = ((TextMessage) msg).getText();
+
             ReplicationEvent ev = G.fromJson(s, ReplicationEvent.class);
             if (ev == null) return;
             if (!"INGESTED".equals(ev.type)) return;
+
+            ev.origin = normalizeOrigin(ev.origin);
             if (ev.origin == null || ev.origin.isBlank()) return;
             if (ev.origin.equals(origin)) return;
 
+            // store only if this node belongs to the replica set for this document
+            if (!replicaSetFor(ev.origin, ev.bookId).contains(origin)) return;
+
             state.put("lastEventRx", Instant.now().toString());
-            System.out.println("REPL RX EVENT origin=" + ev.origin + " bookId=" + ev.bookId + " date=" + ev.date + " hour=" + ev.hour);
 
             if (local.has(ev.date, ev.hour, ev.bookId, ev.sha256Header, ev.sha256Body, ev.sha256Meta)) return;
 
@@ -186,7 +252,6 @@ public class MqReplicationHub implements AutoCloseable {
             } catch (Exception ignored) {}
 
             local.store(ev.date, ev.hour, ev.bookId, header, body, meta, ev.sha256Header, ev.sha256Body, ev.sha256Meta);
-            System.out.println("REPL STORED origin=" + ev.origin + " bookId=" + ev.bookId + " date=" + ev.date + " hour=" + ev.hour);
 
         } catch (Exception e) {
             state.put("lastError", e.toString());
@@ -201,7 +266,13 @@ public class MqReplicationHub implements AutoCloseable {
         int copied = 0;
         for (ManifestEntry me : arr) {
             if (me == null) continue;
+
+            // ONLY copy documents for which we are in the replica set (replication factor R)
+            String primary = normalizeOrigin(peerOrigin);
+            if (!replicaSetFor(primary, me.bookId).contains(origin)) continue;
+
             if (me.date == null || me.hour == null) continue;
+
             if (local.has(me.date, me.hour, me.bookId, me.sha256Header, me.sha256Body, me.sha256Meta)) continue;
 
             String header = httpGet(peerOrigin + "/ingest/file/" + me.bookId + "/header?date=" + me.date + "&hour=" + me.hour);
@@ -218,6 +289,16 @@ public class MqReplicationHub implements AutoCloseable {
 
         state.put("lastSync", Instant.now().toString());
         System.out.println("REPL SYNC from=" + peerOrigin + " copied=" + copied);
+    }
+
+    private List<String> knownOriginsSorted() {
+        Set<String> s = new HashSet<>();
+        s.add(origin);
+        s.addAll(peers.keySet());
+        List<String> out = new ArrayList<>(s);
+        out.removeIf(x -> x == null || x.isBlank());
+        Collections.sort(out);
+        return out;
     }
 
     private static String httpGet(String url) throws Exception {
@@ -237,6 +318,13 @@ public class MqReplicationHub implements AutoCloseable {
 
     private static String str(Object o) {
         return o == null ? null : o.toString();
+    }
+
+    private static String normalizeOrigin(String o) {
+        if (o == null) return null;
+        String x = o.trim();
+        if (x.endsWith("/")) x = x.substring(0, x.length() - 1);
+        return x;
     }
 
     private static String originHost(String origin) {

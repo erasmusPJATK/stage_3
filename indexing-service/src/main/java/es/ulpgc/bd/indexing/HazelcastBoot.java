@@ -1,11 +1,6 @@
 package es.ulpgc.bd.indexing;
 
-import com.hazelcast.config.Config;
-import com.hazelcast.config.InterfacesConfig;
-import com.hazelcast.config.JoinConfig;
-import com.hazelcast.config.MapConfig;
-import com.hazelcast.config.NetworkConfig;
-import com.hazelcast.config.TcpIpConfig;
+import com.hazelcast.config.*;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 
@@ -19,10 +14,14 @@ public class HazelcastBoot {
         Config cfg = new Config();
         cfg.setClusterName(clusterName);
 
-        // ---- Map configs (replication / fault tolerance) ----
-        cfg.addMapConfig(new MapConfig("docs").setBackupCount(1));
-        cfg.addMapConfig(new MapConfig("docTerms").setBackupCount(1));
-        cfg.addMapConfig(new MapConfig("inverted").setBackupCount(1));
+        // Replication (fault tolerance) for the distributed structures
+        cfg.addMapConfig(new MapConfig("docs").setBackupCount(2));
+        cfg.addMapConfig(new MapConfig("docTerms").setBackupCount(2));
+
+        MultiMapConfig mm = new MultiMapConfig("inverted-index");
+        mm.setBackupCount(2);
+        mm.setValueCollectionType(MultiMapConfig.ValueCollectionType.SET);
+        cfg.addMultiMapConfig(mm);
 
         NetworkConfig net = cfg.getNetworkConfig();
         net.setPort(hzPort);
@@ -36,17 +35,23 @@ public class HazelcastBoot {
         }
 
         JoinConfig join = net.getJoin();
-        join.getMulticastConfig().setEnabled(false);
 
         TcpIpConfig tcp = join.getTcpIpConfig();
-        tcp.setEnabled(true);
+        MulticastConfig mc = join.getMulticastConfig();
 
-        if (membersCsv != null && !membersCsv.isBlank()) {
+        if (membersCsv == null || membersCsv.isBlank() || "auto".equalsIgnoreCase(membersCsv) || "multicast".equalsIgnoreCase(membersCsv)) {
+            // Zero-config clustering (matches Stage 3 PDF)
+            tcp.setEnabled(false);
+            mc.setEnabled(true);
+        } else {
+            mc.setEnabled(false);
+            tcp.setEnabled(true);
+
             for (String m : membersCsv.split(",")) {
-                String mm = m.trim();
-                if (mm.isEmpty()) continue;
-                if (mm.contains(":")) tcp.addMember(mm);
-                else tcp.addMember(mm + ":" + hzPort);
+                String mmbr = m.trim();
+                if (mmbr.isEmpty()) continue;
+                if (mmbr.contains(":")) tcp.addMember(mmbr);
+                else tcp.addMember(mmbr + ":" + hzPort);
             }
         }
 

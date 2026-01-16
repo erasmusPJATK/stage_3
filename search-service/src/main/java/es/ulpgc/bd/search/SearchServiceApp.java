@@ -1,10 +1,6 @@
 package es.ulpgc.bd.search;
 
-import com.hazelcast.config.Config;
-import com.hazelcast.config.InterfacesConfig;
-import com.hazelcast.config.JoinConfig;
-import com.hazelcast.config.NetworkConfig;
-import com.hazelcast.config.TcpIpConfig;
+import com.hazelcast.config.*;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import es.ulpgc.bd.search.api.SearchHttpApi;
@@ -20,19 +16,33 @@ public class SearchServiceApp {
 
         final int port = Integer.parseInt(a.getOrDefault("port", "7003"));
 
-        final String hzCluster = a.getOrDefault("hzCluster", a.getOrDefault("hz.cluster", "bd-hz"));
-        final String hzMembers = a.getOrDefault("hzMembers", a.getOrDefault("hz.members", "127.0.0.1"));
-        final int hzPort = Integer.parseInt(a.getOrDefault("hzPort", a.getOrDefault("hz.port", "5701")));
-        final String hzInterface = a.getOrDefault("hzInterface", a.getOrDefault("hz.interface", ""));
+        final String hzCluster = first(a, "hzCluster", "hz.cluster", "hz.clusterName", "hz.cluster-name", "hz");
+        final String clusterName = (hzCluster != null) ? hzCluster : "bd-hz";
 
+        final String hzMembersTmp = first(a, "hzMembers", "hz.members", "hzMembersCsv");
+        final String hzMembers = (hzMembersTmp != null) ? hzMembersTmp : "auto";
+
+        final int hzPort = Integer.parseInt(a.getOrDefault("hzPort", a.getOrDefault("hz.port", "5701")));
+        final String hzInterface = first(a, "hzInterface", "hz.interface");
+
+        // ---------------- Hazelcast config (MUST MATCH indexing-service) ----------------
         Config cfg = new Config();
-        cfg.setClusterName(hzCluster);
+        cfg.setClusterName(clusterName);
+
+        // Replication (fault tolerance) for the distributed structures
+        cfg.addMapConfig(new MapConfig("docs").setBackupCount(2));
+        cfg.addMapConfig(new MapConfig("docTerms").setBackupCount(2));
+
+        MultiMapConfig mm = new MultiMapConfig("inverted-index");
+        mm.setBackupCount(2);
+        mm.setValueCollectionType(MultiMapConfig.ValueCollectionType.SET);
+        cfg.addMultiMapConfig(mm);
 
         NetworkConfig net = cfg.getNetworkConfig();
         net.setPort(hzPort);
         net.setPortAutoIncrement(true);
 
-        if (!hzInterface.isBlank()) {
+        if (hzInterface != null && !hzInterface.isBlank()) {
             InterfacesConfig ifc = net.getInterfaces();
             ifc.setEnabled(true);
             ifc.addInterface(hzInterface);
@@ -40,21 +50,33 @@ public class SearchServiceApp {
         }
 
         JoinConfig join = net.getJoin();
-        join.getMulticastConfig().setEnabled(false);
-
         TcpIpConfig tcp = join.getTcpIpConfig();
-        tcp.setEnabled(true);
+        MulticastConfig mc = join.getMulticastConfig();
 
-        for (String m : hzMembers.split(",")) {
-            String mm = m.trim();
-            if (mm.isEmpty()) continue;
-            if (mm.contains(":")) tcp.addMember(mm);
-            else tcp.addMember(mm + ":" + hzPort);
+        if (hzMembers.isBlank()
+                || "auto".equalsIgnoreCase(hzMembers)
+                || "multicast".equalsIgnoreCase(hzMembers)) {
+
+            // Zero-config clustering (PDF hints mention multicast)
+            tcp.setEnabled(false);
+            mc.setEnabled(true);
+
+        } else {
+            mc.setEnabled(false);
+            tcp.setEnabled(true);
+
+            for (String m : hzMembers.split(",")) {
+                String mmbr = m.trim();
+                if (mmbr.isEmpty()) continue;
+                if (mmbr.contains(":")) tcp.addMember(mmbr);
+                else tcp.addMember(mmbr + ":" + hzPort);
+            }
         }
 
         HazelcastInstance hz = Hazelcast.newHazelcastInstance(cfg);
 
-        SearchService service = new SearchService(hz, hzCluster, hzMembers, port);
+        // ---------------- App ----------------
+        SearchService service = new SearchService(hz, clusterName, hzMembers, port);
 
         Javalin app = Javalin.create().start(port);
         new SearchHttpApi(service).register(app);
@@ -64,6 +86,14 @@ public class SearchServiceApp {
             try { hz.shutdown(); } catch (Exception ignored) {}
         }));
 
-        System.out.println("Search listening on :" + port + " hzCluster=" + hzCluster);
+        System.out.println("Search listening on :" + port + " hzCluster=" + clusterName + " hzMembers=" + hzMembers);
+    }
+
+    private static String first(Map<String, String> m, String... keys) {
+        for (String k : keys) {
+            String v = m.get(k);
+            if (v != null && !v.isBlank()) return v;
+        }
+        return null;
     }
 }

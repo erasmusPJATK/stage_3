@@ -128,7 +128,7 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
 
             ReplicationEvent ev = new ReplicationEvent();
             ev.type = "INGESTED";
-            ev.origin = origin;
+            ev.origin = normalizeOrigin(origin);
             ev.bookId = bookId;
             ev.date = date;
             ev.hour = hour;
@@ -150,12 +150,25 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
                 replMessage = ex.getMessage();
             }
 
+            // ✅ NEW: emit indexing message with candidate sources (origin + replicas)
+            String[] sources = null;
+            try {
+                if (hub != null) {
+                    List<String> set = hub.replicaSetFor(ev.origin, bookId);
+                    sources = set.toArray(new String[0]);
+                }
+            } catch (Exception ignored) {}
+
+            if (sources == null || sources.length == 0) {
+                sources = new String[]{ev.origin};
+            }
+
             String indexingStatus = "skipped";
             String indexingMessage = null;
 
             try {
                 if (indexingProducer != null) {
-                    indexingProducer.publish(bookId, origin);
+                    indexingProducer.publish(bookId, ev.origin, sources);
                     indexingStatus = "ok";
                 }
             } catch (Exception ex) {
@@ -188,6 +201,7 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
 
             response.put("indexing_event_publish", indexingStatus);
             response.put("indexing_queue", indexingQueueName);
+            response.put("indexing_sources", sources);
             if (indexingMessage != null && !indexingMessage.isBlank()) response.put("indexing_message", indexingMessage);
 
         } catch (Exception e) {
@@ -362,6 +376,13 @@ public class IngestionService implements MqReplicationHub.LocalFiles {
         } catch (Exception e) {
             return "";
         }
+    }
+
+    private static String normalizeOrigin(String o) {
+        if (o == null) return "";
+        String x = o.trim();
+        if (x.endsWith("/")) x = x.substring(0, x.length() - 1);
+        return x;
     }
 
     @Override

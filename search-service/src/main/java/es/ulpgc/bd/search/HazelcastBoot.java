@@ -3,6 +3,9 @@ package es.ulpgc.bd.search;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InterfacesConfig;
 import com.hazelcast.config.JoinConfig;
+import com.hazelcast.config.MapConfig;
+import com.hazelcast.config.MultiMapConfig;
+import com.hazelcast.config.MulticastConfig;
 import com.hazelcast.config.NetworkConfig;
 import com.hazelcast.config.TcpIpConfig;
 import com.hazelcast.core.Hazelcast;
@@ -18,6 +21,11 @@ public class HazelcastBoot {
         Config cfg = new Config();
         cfg.setClusterName(clusterName);
 
+        int backupCount = 2;
+        cfg.addMapConfig(new MapConfig("docs").setBackupCount(backupCount));
+        cfg.addMapConfig(new MapConfig("docTerms").setBackupCount(backupCount));
+        cfg.addMultiMapConfig(new MultiMapConfig("inverted-index").setBackupCount(backupCount));
+
         NetworkConfig net = cfg.getNetworkConfig();
         net.setPort(port);
         net.setPortAutoIncrement(true);
@@ -29,17 +37,28 @@ public class HazelcastBoot {
         }
 
         JoinConfig join = net.getJoin();
-        join.getMulticastConfig().setEnabled(false);
-
         TcpIpConfig tcp = join.getTcpIpConfig();
-        tcp.setEnabled(true);
+        MulticastConfig mc = join.getMulticastConfig();
 
-        List<String> members = Arrays.stream(membersCsv.split(","))
-                .map(String::trim)
-                .filter(s -> !s.isBlank())
-                .collect(Collectors.toList());
+        if (membersCsv == null || membersCsv.isBlank()
+                || "auto".equalsIgnoreCase(membersCsv)
+                || "multicast".equalsIgnoreCase(membersCsv)) {
+            tcp.setEnabled(false);
+            mc.setEnabled(true);
+        } else {
+            mc.setEnabled(false);
+            tcp.setEnabled(true);
 
-        for (String m : members) tcp.addMember(m);
+            List<String> members = Arrays.stream(membersCsv.split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isBlank())
+                    .collect(Collectors.toList());
+
+            for (String m : members) {
+                if (m.contains(":")) tcp.addMember(m);
+                else tcp.addMember(m + ":" + port);
+            }
+        }
 
         return Hazelcast.newHazelcastInstance(cfg);
     }

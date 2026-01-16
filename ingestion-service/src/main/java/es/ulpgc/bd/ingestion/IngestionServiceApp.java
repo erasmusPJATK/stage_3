@@ -27,6 +27,8 @@ public class IngestionServiceApp {
 
         String indexingQueue = a.getOrDefault("indexingQueue", "ingestion.ingested");
 
+        int replFactor = Integer.parseInt(a.getOrDefault("replFactor", a.getOrDefault("replicationFactor", "2")));
+
         Path moduleRoot = detectModuleRoot(IngestionServiceApp.class);
         Path datalake = moduleRoot.resolve("datalake").toAbsolutePath().normalize();
         String parserVersion = a.getOrDefault("parser", "gutenberg-heuristics-8");
@@ -39,7 +41,7 @@ public class IngestionServiceApp {
         service.setOrigin(origin);
         service.setMq(mq);
 
-        MqReplicationHub hub = new MqReplicationHub(mq, origin, service);
+        MqReplicationHub hub = new MqReplicationHub(mq, origin, service, replFactor);
         hub.start();
         service.setReplicationHub(hub);
 
@@ -52,7 +54,12 @@ public class IngestionServiceApp {
             try { hub.close(); } catch (Exception ignored) {}
         }));
 
-        System.out.println("Ingestion listening on :" + port + " datalake=" + datalake + " mq=" + mq + " origin=" + origin + " indexingQueue=" + indexingQueue);
+        System.out.println("Ingestion listening on :" + port
+                + " datalake=" + datalake
+                + " mq=" + mq
+                + " origin=" + origin
+                + " indexingQueue=" + indexingQueue
+                + " replFactor=" + replFactor);
     }
 
     private static Path detectModuleRoot(Class<?> anchor) {
