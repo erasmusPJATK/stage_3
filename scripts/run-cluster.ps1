@@ -1,48 +1,92 @@
 param(
-  [Parameter(Mandatory=$true)]
-  [ValidateSet("A","B","C")]
-  [string]$Role,
+  [ValidateSet("local","cluster")]
+  [string]$Mode = "local",
 
-  [string]$Nodes = "192.168.1.144,192.168.1.139,192.168.1.201",
+  [string]$Nodes = "",
 
-  [string]$MqHost = "192.168.1.144"
+  [string]$Me = "",
+
+  [string]$MqHost = "",
+
+  [switch]$Infra,
+
+  [int]$ScaleSearch = 1
 )
 
 $ErrorActionPreference = "Stop"
 
-$nodeList = $Nodes.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
-if ($nodeList.Count -lt 3) {
-  throw "Nodes must contain 3 comma-separated IPs, e.g. 192.168.1.144,192.168.1.139,192.168.1.201"
+function Get-MyIp {
+  try {
+    $ip = (Get-NetIPAddress -AddressFamily IPv4 |
+            Where-Object { $_.IPAddress -match "^\d+\.\d+\.\d+\.\d+$" -and $_.IPAddress -ne "127.0.0.1" } |
+            Select-Object -First 1 -ExpandProperty IPAddress)
+    return $ip
+  } catch { return "" }
 }
-
-$ipMap = @{
-  "A" = $nodeList[0]
-  "B" = $nodeList[1]
-  "C" = $nodeList[2]
-}
-
-$hostIp = $ipMap[$Role]
-$mqUrl = "tcp://$MqHost:61616"
-$originUrl = "http://$hostIp:7001"
-$replFactor = 3
-
-$members = @(
-  "$($nodeList[0]):5701","$($nodeList[0]):5702",
-  "$($nodeList[1]):5701","$($nodeList[1]):5702",
-  "$($nodeList[2]):5701","$($nodeList[2]):5702"
-) -join ","
 
 $projectRoot = Join-Path $PSScriptRoot ".."
-$runtimeDir = Join-Path $projectRoot ".runtime"
-$nginxDir = Join-Path $runtimeDir "nginx"
-
+$runtimeDir  = Join-Path $projectRoot ".runtime"
+$nginxDir    = Join-Path $runtimeDir "nginx"
 New-Item -ItemType Directory -Force -Path $nginxDir | Out-Null
 
-if ($Role -eq "A") {
-  $nginxConfPath = Join-Path $nginxDir "default.conf"
-  $upstreams = $nodeList | ForEach-Object { "  server ${_}:7003 max_fails=2 fail_timeout=2s;" }
+$nginxConfPath = Join-Path $nginxDir "default.conf"
+$overridePath  = Join-Path $runtimeDir "cluster.override.yml"
+
+if ($Mode -eq "local") {
 
   $nginxText = @"
+resolver 127.0.0.11 ipv6=off valid=2s;
+
+server {
+  listen 80;
+
+  location / {
+    set `$backend "search:7003";
+    proxy_pass http://`$backend;
+
+    add_header X-Upstream `$upstream_addr always;
+
+    proxy_connect_timeout 3s;
+    proxy_send_timeout 30s;
+    proxy_read_timeout 30s;
+
+    proxy_next_upstream error timeout http_502 http_503 http_504;
+  }
+}
+"@
+  [System.IO.File]::WriteAllText($nginxConfPath, $nginxText, [System.Text.Encoding]::ASCII)
+
+  Push-Location $projectRoot
+  try {
+    docker compose -f docker-compose.infra.yml -f docker-compose.yml up -d --build --scale search=$ScaleSearch
+  } finally {
+    Pop-Location
+  }
+
+  Write-Host "OK (LOCAL). LB: http://localhost:18080/status"
+  exit 0
+}
+
+$nodeList = $Nodes.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+if ($nodeList.Count -lt 1) { throw "Cluster mode requires -Nodes, e.g. -Nodes `"192.168.1.144,192.168.1.139`"" }
+
+if ([string]::IsNullOrWhiteSpace($Me)) { $Me = Get-MyIp }
+if ([string]::IsNullOrWhiteSpace($Me)) { throw "Cannot detect local IP. Pass -Me <your_ip>." }
+
+if ([string]::IsNullOrWhiteSpace($MqHost)) { $MqHost = $nodeList[0] }
+$mqUrl = "tcp://$MqHost:61616"
+
+$replFactor = [Math]::Min($nodeList.Count, 3)
+
+$members = @()
+foreach ($n in $nodeList) {
+  $members += "$n:5701"
+  $members += "$n:5702"
+}
+$membersCsv = ($members -join ",")
+
+$upstreams = $nodeList | ForEach-Object { "  server ${_}:7003 max_fails=2 fail_timeout=2s;" }
+$nginxText = @"
 upstream search_cluster {
   least_conn;
 $($upstreams -join "`n")
@@ -53,12 +97,7 @@ server {
 
   location / {
     proxy_pass http://search_cluster;
-
-    proxy_http_version 1.1;
-    proxy_set_header Connection "";
-    proxy_set_header Host `$host;
-    proxy_set_header X-Forwarded-For `$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto `$scheme;
+    add_header X-Upstream `$upstream_addr always;
 
     proxy_connect_timeout 3s;
     proxy_send_timeout 30s;
@@ -68,10 +107,7 @@ server {
   }
 }
 "@
-  $nginxText | Set-Content -NoNewline -Encoding UTF8 $nginxConfPath
-}
-
-$overridePath = Join-Path $runtimeDir "cluster.override.yml"
+[System.IO.File]::WriteAllText($nginxConfPath, $nginxText, [System.Text.Encoding]::ASCII)
 
 $override = @"
 services:
@@ -83,67 +119,54 @@ services:
       - -jar
       - /app/app.jar
       - --port=7001
-      - --origin=$originUrl
       - --mq=$mqUrl
       - --indexingQueue=ingestion.ingested
-      - --indexingMqEnabled=true
+      - --origin=http://$Me:7001
       - --replFactor=$replFactor
 
   indexing:
     ports:
       - "7002:7002"
       - "5701:5701"
-    environment:
-      - JAVA_TOOL_OPTIONS=-Dhazelcast.local.publicAddress=$hostIp:5701
     command:
       - java
       - -jar
       - /app/app.jar
       - --port=7002
       - --mq=$mqUrl
-      - --mqEnabled=true
-      - --ingestion=http://$hostIp:7001
+      - --ingestion=http://ingestion:7001
       - --hzCluster=bd-hz
-      - --hzMembers=$members
+      - --hzMembers=$membersCsv
+      - --hzPort=5701
+      - --hzInterface=$Me
 
   search:
     ports:
       - "7003:7003"
-      - "5702:5701"
-    environment:
-      - JAVA_TOOL_OPTIONS=-Dhazelcast.local.publicAddress=$hostIp:5702
+      - "5702:5702"
     command:
       - java
       - -jar
       - /app/app.jar
       - --port=7003
       - --hzCluster=bd-hz
-      - --hzMembers=$members
+      - --hzMembers=$membersCsv
+      - --hzPort=5702
+      - --hzInterface=$Me
 "@
-
-if ($Role -eq "A") {
-  $override += @"
-
-  lb:
-    volumes:
-      - ./.runtime/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
-"@
-}
-
 $override | Set-Content -NoNewline -Encoding UTF8 $overridePath
 
 Push-Location $projectRoot
 try {
-  if ($Role -eq "A") {
-    docker compose -f docker-compose.infra.yml -f docker-compose.yml -f ./.runtime/cluster.override.yml up -d --build
-  } else {
-    docker compose -f docker-compose.yml -f ./.runtime/cluster.override.yml up -d --build --no-deps ingestion indexing search
+  if ($Infra) {
+    docker compose -f docker-compose.infra.yml up -d --build
   }
+  docker compose -f docker-compose.yml -f ./.runtime/cluster.override.yml up -d --build
 } finally {
   Pop-Location
 }
 
-Write-Host "OK: node $Role started (HOST_IP=$hostIp, MQ=$mqUrl)"
-if ($Role -eq "A") {
-  Write-Host "LB: http://$hostIp:18080/status"
+Write-Host "OK (CLUSTER). ME=$Me MQ=$mqUrl R=$replFactor"
+if ($Infra) {
+  Write-Host "LB: http://$Me:18080/status"
 }

@@ -1,11 +1,8 @@
 services:
   ingestion:
     build: ./ingestion-service
-    container_name: ingestion
     ports:
       - "7001:7001"
-    depends_on:
-      - activemq
     volumes:
       - ingestion_datalake:/app/datalake
     command:
@@ -16,16 +13,13 @@ services:
       - --mq=tcp://activemq:61616
       - --indexingQueue=ingestion.ingested
       - --origin=http://ingestion:7001
-      - --replFactor=${REPL_FACTOR:-2}
+      - --replFactor=2
     restart: unless-stopped
 
   indexing:
     build: ./indexing-service
-    container_name: indexing
     ports:
       - "7002:7002"
-    depends_on:
-      - activemq
     command:
       - java
       - -jar
@@ -34,7 +28,7 @@ services:
       - --mq=tcp://activemq:61616
       - --ingestion=http://ingestion:7001
       - --hzCluster=bd-hz
-      - --hzMembers=${HZ_MEMBERS:-indexing,search}
+      - --hzMembers=indexing,search
     restart: unless-stopped
 
   search:
@@ -49,19 +43,8 @@ services:
       - /app/app.jar
       - --port=7003
       - --hzCluster=bd-hz
-      - --hzMembers=${HZ_MEMBERS:-indexing,search}
+      - --hzMembers=indexing,search
     restart: unless-stopped
-
-  activemq:
-    image: rmohr/activemq:latest
-    container_name: activemq
-    restart: unless-stopped
-    ports:
-      - "61616:61616"
-      - "8161:8161"
-    environment:
-      - ACTIVEMQ_ADMIN_LOGIN=admin
-      - ACTIVEMQ_ADMIN_PASSWORD=admin
 
 volumes:
   ingestion_datalake:
