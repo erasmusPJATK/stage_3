@@ -38,6 +38,7 @@ if ($Mode -eq "local") {
 resolver 127.0.0.11 ipv6=off valid=2s;
 
 upstream search_cluster {
+  zone search_cluster 64k;
   least_conn;
   server search:7003 resolve;
 }
@@ -47,7 +48,7 @@ server {
 
   location / {
     proxy_pass http://search_cluster;
-    add_header X-Upstream `$upstream_addr always;
+    add_header X-Upstream $upstream_addr always;
     proxy_next_upstream error timeout http_502 http_503 http_504;
   }
 }
@@ -83,9 +84,20 @@ foreach ($n in $nodeList) {
 }
 $membersCsv = ($members -join ",")
 
-$upstreams = $nodeList | ForEach-Object { "  server ${_}:7003 max_fails=2 fail_timeout=2s;" }
+# upstreamy: lokalny search po docker DNS + zdalne po IP
+$upstreams = @("  server search:7003 resolve max_fails=2 fail_timeout=2s;")
+
+foreach ($n in $nodeList) {
+  if ($n -ne $Me) {
+    $upstreams += "  server ${n}:7003 max_fails=2 fail_timeout=2s;"
+  }
+}
+
 $nginxText = @"
+resolver 127.0.0.11 ipv6=off valid=2s;
+
 upstream search_cluster {
+  zone search_cluster 64k;
   least_conn;
 $($upstreams -join "`n")
 }
