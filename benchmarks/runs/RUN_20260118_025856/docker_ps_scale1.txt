@@ -1,0 +1,6 @@
+﻿NAMES               STATUS         PORTS
+task3-search-1      Up 9 seconds   7003/tcp
+task3-activemq-1    Up 9 seconds   1883/tcp, 5672/tcp, 61613-61614/tcp, 0.0.0.0:61616->61616/tcp, 0.0.0.0:8162->8161/tcp
+task3-ingestion-1   Up 7 seconds   0.0.0.0:7001->7001/tcp
+task3-indexing-1    Up 9 seconds   0.0.0.0:7002->7002/tcp
+task3-lb-1          Up 9 seconds   0.0.0.0:18080->80/tcp

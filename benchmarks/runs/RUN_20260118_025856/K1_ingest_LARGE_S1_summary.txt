@@ -1,0 +1,1 @@
+﻿pack=LARGE docs_ok=154 docs_total=155 time_s=120.721 docs_per_s=1.2757

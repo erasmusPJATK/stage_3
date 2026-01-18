@@ -1,0 +1,7 @@
+﻿scale,pack,docs_expected,docs_ingested_ok,index_ok,search_requests
+1,SMALL,10,10,True,200
+1,MEDIUM,50,49,True,200
+1,LARGE,155,154,True,200
+3,SMALL,10,10,True,200
+3,MEDIUM,50,49,True,200
+3,LARGE,155,154,True,200

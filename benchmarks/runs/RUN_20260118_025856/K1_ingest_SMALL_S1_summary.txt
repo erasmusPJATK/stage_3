@@ -1,0 +1,1 @@
+﻿pack=SMALL docs_ok=10 docs_total=10 time_s=10.794 docs_per_s=0.9265
