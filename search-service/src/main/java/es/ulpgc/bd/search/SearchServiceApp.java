@@ -25,11 +25,9 @@ public class SearchServiceApp {
         final int hzPort = Integer.parseInt(a.getOrDefault("hzPort", a.getOrDefault("hz.port", "5701")));
         final String hzInterface = first(a, "hzInterface", "hz.interface");
 
-        // ---------------- Hazelcast config (MUST MATCH indexing-service) ----------------
         Config cfg = new Config();
         cfg.setClusterName(clusterName);
 
-        // Replication (fault tolerance) for the distributed structures
         cfg.addMapConfig(new MapConfig("docs").setBackupCount(2));
         cfg.addMapConfig(new MapConfig("docTerms").setBackupCount(2));
 
@@ -43,10 +41,7 @@ public class SearchServiceApp {
         net.setPortAutoIncrement(true);
 
         if (hzInterface != null && !hzInterface.isBlank()) {
-            InterfacesConfig ifc = net.getInterfaces();
-            ifc.setEnabled(true);
-            ifc.addInterface(hzInterface);
-            net.setPublicAddress(hzInterface + ":" + hzPort);
+            net.setPublicAddress(hzInterface.trim() + ":" + hzPort);
         }
 
         JoinConfig join = net.getJoin();
@@ -57,7 +52,6 @@ public class SearchServiceApp {
                 || "auto".equalsIgnoreCase(hzMembers)
                 || "multicast".equalsIgnoreCase(hzMembers)) {
 
-            // Zero-config clustering (PDF hints mention multicast)
             tcp.setEnabled(false);
             mc.setEnabled(true);
 
@@ -75,7 +69,6 @@ public class SearchServiceApp {
 
         HazelcastInstance hz = Hazelcast.newHazelcastInstance(cfg);
 
-        // ---------------- App ----------------
         SearchService service = new SearchService(hz, clusterName, hzMembers, port);
 
         Javalin app = Javalin.create().start(port);

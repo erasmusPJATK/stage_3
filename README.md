@@ -195,9 +195,223 @@ curl "http://localhost:18080/search?q=love&limit=10" > NUL
 
 ---
 
-## 8) Demo Video
+## 8) Fault-tolerance demo
 
+YouTube: https://youtu.be/5aNk8ygCM14
 
+Below is the full demo script for the video. Commands are shown for **CMD**.
+
+### (1) Network configuration
+
+**A**
+```cmd
+ipconfig
+```
+
+**B**
+```cmd
+ipconfig
+```
+
+Explain:
+- LAN IPs (Wi-Fi)
+- both machines are in the same subnet
+
+---
+
+### (2) Start services
+
+**A**
+```cmd
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-cluster.ps1 -Mode cluster -Nodes "192.168.1.151,192.168.1.139" -Me 192.168.1.151 -Infra
+```
+
+**B**
+```cmd
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-cluster.ps1 -Mode cluster -Nodes "192.168.1.151,192.168.1.139" -Me 192.168.1.139
+```
+
+---
+
+### (3) Validate all services (local + remote)
+
+**A**
+```cmd
+docker ps
+curl -i "http://127.0.0.1:18080/status"
+curl -i "http://127.0.0.1:7001/status"
+curl -i "http://127.0.0.1:7002/index/status"
+curl -i "http://127.0.0.1:7003/hz/members"
+
+curl -i "http://192.168.1.139:7001/status"
+curl -i "http://192.168.1.139:7002/index/status"
+curl -i "http://192.168.1.139:7003/hz/members"
+```
+
+**B**
+```cmd
+docker ps
+curl -i "http://127.0.0.1:7001/status"
+curl -i "http://127.0.0.1:7002/index/status"
+curl -i "http://127.0.0.1:7003/hz/members"
+
+curl -i "http://192.168.1.151:18080/status"
+curl -i "http://192.168.1.151:7001/status"
+curl -i "http://192.168.1.151:7002/index/status"
+curl -i "http://192.168.1.151:7003/hz/members"
+```
+
+---
+
+### (4) Ingest + automatic indexing
+
+**A**
+```cmd
+curl -s -X POST "http://127.0.0.1:7001/ingest/222"
+curl -s "http://127.0.0.1:7002/index/status"
+curl -i "http://127.0.0.1:18080/search?q=moon&limit=5"
+```
+
+**B**
+```cmd
+curl -s "http://127.0.0.1:7002/index/status"
+curl -i "http://127.0.0.1:7003/search?q=moon&limit=5"
+```
+
+---
+
+### (5) Search from both nodes
+
+**A (LB)**
+```cmd
+curl -i "http://127.0.0.1:18080/search?q=the&limit=3"
+curl -i "http://127.0.0.1:18080/search?q=human&limit=3"
+curl -i "http://127.0.0.1:18080/search?q=war&limit=3"
+```
+
+**B (direct Search)**
+```cmd
+curl -i "http://127.0.0.1:7003/search?q=the&limit=3"
+curl -i "http://127.0.0.1:7003/search?q=human&limit=3"
+curl -i "http://127.0.0.1:7003/search?q=war&limit=3"
+```
+
+---
+
+### (6) Kill Search on Node B (system keeps working)
+
+**B**
+```cmd
+docker compose stop search
+docker ps
+curl -i "http://127.0.0.1:7003/hz/members"
+curl -i "http://127.0.0.1:7003/search?q=moon&limit=5"
+```
+
+**A**
+```cmd
+curl -i "http://127.0.0.1:7003/hz/members"
+curl -i "http://127.0.0.1:18080/search?q=moon&limit=5"
+```
+
+Explain:
+- Hazelcast membership shrinks
+- Nginx LB still forwards to the remaining Search replica
+
+---
+
+### (7) Restart Search on Node B (auto re-join)
+
+**B**
+```cmd
+docker compose start search
+docker ps
+curl -i "http://127.0.0.1:7003/hz/members"
+curl -i "http://127.0.0.1:7003/search?q=moon&limit=5"
+```
+
+**A**
+```cmd
+curl -i "http://127.0.0.1:7003/hz/members"
+```
+
+---
+
+### (8) Stop Indexing on Node A (search still answers)
+
+**A**
+```cmd
+docker compose stop indexing
+docker ps
+curl -i "http://127.0.0.1:7003/hz/members"
+curl -i "http://127.0.0.1:18080/search?q=moon&limit=5"
+```
+
+**B**
+```cmd
+curl -i "http://127.0.0.1:7003/hz/members"
+curl -i "http://127.0.0.1:7003/search?q=moon&limit=5"
+```
+
+---
+
+### (9) Ingest while Indexing is down, then recover
+
+**A (Indexing stopped)**
+```cmd
+curl -s -X POST "http://127.0.0.1:7001/ingest/34"
+curl -i "http://127.0.0.1:7002/index/status"
+curl -i "http://192.168.1.139:7002/index/status"
+curl -i "http://127.0.0.1:18080/search?q=internet&limit=5"
+```
+
+**B**
+```cmd
+curl -i "http://127.0.0.1:7002/index/status"
+curl -i "http://127.0.0.1:7003/search?q=internet&limit=5"
+```
+
+**A (recover Indexing)**
+```cmd
+docker compose start indexing
+docker ps
+curl -s "http://127.0.0.1:7002/index/status"
+curl -i "http://127.0.0.1:18080/search?q=internet&limit=5"
+```
+
+---
+
+### (10) Stop ingestion + stop indexing on the other node
+
+**A**
+```cmd
+docker compose stop ingestion
+docker ps
+```
+
+**B**
+```cmd
+docker compose stop indexing
+docker ps
+curl -i "http://127.0.0.1:7003/hz/members"
+
+curl -s -X POST "http://127.0.0.1:7001/ingest/999"
+curl -i "http://127.0.0.1:7003/search?q=commedia&limit=5"
+```
+
+**A (search via LB still works for existing index)**
+```cmd
+curl -i "http://127.0.0.1:18080/search?q=commedia&limit=5"
+
+docker compose start ingestion
+docker ps
+```
+
+**B (recover Indexing)**
+```cmd
+docker compose start indexing
+docker ps
+```
 
 ---
 

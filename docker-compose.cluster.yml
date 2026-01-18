@@ -1,0 +1,22 @@
+services:
+  ingestion:
+    ports:
+      - "7001:7001"
+    environment:
+      - MQ_URL=${MQ_URL}
+      - ORIGIN_URL=${ORIGIN_URL}
+      - REPL_FACTOR=${REPL_FACTOR}
+
+  indexing:
+    ports:
+      - "7002:7002"
+      - "5701:5701"
+    environment:
+      - JAVA_TOOL_OPTIONS=-Dhazelcast.local.publicAddress=${HOST_IP}:5701
+
+  search:
+    ports:
+      - "7003:7003"
+      - "5702:5701"
+    environment:
+      - JAVA_TOOL_OPTIONS=-Dhazelcast.local.publicAddress=${HOST_IP}:5702

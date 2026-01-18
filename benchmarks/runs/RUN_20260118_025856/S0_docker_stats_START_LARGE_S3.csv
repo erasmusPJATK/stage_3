@@ -1,0 +1,8 @@
+﻿# name,cpu,mem_usage,mem_perc
+task3-search-3,23.89%,103.5MiB / 15.47GiB,0.65%
+task3-search-2,0.58%,134.5MiB / 15.47GiB,0.85%
+task3-search-1,79.81%,189.8MiB / 15.47GiB,1.20%
+task3-activemq-1,0.26%,263.1MiB / 15.47GiB,1.66%
+task3-ingestion-1,0.09%,83.54MiB / 15.47GiB,0.53%
+task3-lb-1,0.00%,13.14MiB / 15.47GiB,0.08%
+task3-indexing-1,0.69%,203.5MiB / 15.47GiB,1.28%

@@ -14,7 +14,6 @@ public class HazelcastBoot {
         Config cfg = new Config();
         cfg.setClusterName(clusterName);
 
-        // Replication (fault tolerance) for the distributed structures
         cfg.addMapConfig(new MapConfig("docs").setBackupCount(2));
         cfg.addMapConfig(new MapConfig("docTerms").setBackupCount(2));
 
@@ -28,10 +27,7 @@ public class HazelcastBoot {
         net.setPortAutoIncrement(true);
 
         if (hzInterface != null && !hzInterface.isBlank()) {
-            InterfacesConfig ifc = net.getInterfaces();
-            ifc.setEnabled(true);
-            ifc.addInterface(hzInterface);
-            net.setPublicAddress(hzInterface + ":" + hzPort);
+            net.setPublicAddress(hzInterface.trim() + ":" + hzPort);
         }
 
         JoinConfig join = net.getJoin();
@@ -40,7 +36,6 @@ public class HazelcastBoot {
         MulticastConfig mc = join.getMulticastConfig();
 
         if (membersCsv == null || membersCsv.isBlank() || "auto".equalsIgnoreCase(membersCsv) || "multicast".equalsIgnoreCase(membersCsv)) {
-            // Zero-config clustering (matches Stage 3 PDF)
             tcp.setEnabled(false);
             mc.setEnabled(true);
         } else {
